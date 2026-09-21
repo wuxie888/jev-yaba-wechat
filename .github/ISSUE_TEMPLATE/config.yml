@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
-  - name: 使用说明与已知限制
-    url: https://github.com/jev-jarvis/jev-jarvis/blob/master/README.md
-    about: 用法、配置（两层 LLM 的 key 放哪）、面板怎么读、已知限制与下一步，提 issue 前建议先看这里
-  - name: 提「填入 / 权限」相关问题前
-    url: https://github.com/jev-jarvis/jev-jarvis/blob/master/README.md#用法
-    about: 屏幕录制与辅助功能两个权限的授权方式、以及「填入」不走剪贴板的说明，都在这节
+  - name: jev-哑巴微信使用说明
+    url: https://github.com/wuxie888/jev-yaba-wechat/blob/main/README.md
+    about: 配置、构建、品牌预览与当前限制
+  - name: 当前验证范围
+    url: https://github.com/wuxie888/jev-yaba-wechat/blob/main/docs/BRAND_VERIFICATION.md
+    about: 已验证内容与尚未验收的真实微信/API 流程

@@ -53,15 +53,18 @@ from AppKit import (
 from Foundation import NSMakeRect, NSMakeSize, NSObject, NSTimer
 
 sys.path.insert(0, str(Path(__file__).parent))
+import brand  # noqa: E402
 import userconfig  # noqa: E402
 
-userconfig.load()   # ~/.config/jev-jarvis/env -> os.environ (Finder apps inherit none)
+userconfig.load()   # ~/.config/jev-yaba-wechat/env -> os.environ (Finder apps inherit none)
 
 from perception import read_conversation, screen_capture_ok, request_screen_capture  # noqa: E402
 from judge import make_judge  # noqa: E402
 from generate import Generator, load_credentials  # noqa: E402
 import styles  # noqa: E402
 import fill  # noqa: E402
+
+BRAND_PREVIEW = "--brand-preview" in sys.argv
 
 PANEL_W, PANEL_H = 360, 614   # tall enough for 3-line candidates + the chat name row
 COLLAPSED_H = 96              # height when the panel is rolled up
@@ -86,17 +89,18 @@ def _rgb(hex_code: int, alpha: float = 1.0) -> NSColor:
 
 
 PALETTE = {
-    "bg": _rgb(0xF7F7F7),     # panel surface
+    "bg": _rgb(0xFFF9FC),     # panel surface
     "text": _rgb(0x191919),   # judged message, intent, candidates, action advice
     "muted": _rgb(0x888888),  # status, sender/context, confidence, percentages, headers
+    "brand": _rgb(0xD92887),
     "green": _rgb(0x07C160),  # WeChat brand green — risk 安全, success feedback
     "amber": _rgb(0xFA9D3B),  # risk 留神
     "red": _rgb(0xFA5151),    # risk 危险, failures
     # The 话术 dropdown is drawn as a WeChat-style field: a flat light surface with a
     # hairline, because the stock popup bezel brings the system accent colour (a blue
     # chevron) into a panel that has no other system-accent pixel in it.
-    "field": _rgb(0xF2F2F2),
-    "edge": _rgb(0xE3E3E3),
+    "field": _rgb(0xFFF0F7),
+    "edge": _rgb(0xF0D9E5),
 }
 
 # Candidate row geometry. A row is 48 pt tall inside a 56 pt pitch, so rows keep the same
@@ -125,11 +129,11 @@ GROUP_GAP = 12            # between one group's rows and the next group's dropdo
 BOTTOM_PAD = 18           # below the last group
 
 
-LOG_PATH = Path.home() / "Library" / "Logs" / "jev-jarvis.log"
+LOG_PATH = Path.home() / "Library" / "Logs" / f"{brand.APP_SLUG}.log"
 
 
 def _log(msg: str) -> None:
-    """One line per stage: to stdout, and into ~/Library/Logs/jev-jarvis.log.
+    """One line per stage: to stdout, and into ~/Library/Logs/jev-yaba-wechat.log.
 
     "It feels slow" is not actionable on its own, so every analysis prints what each stage
     cost; that is the whole point of this function. Deliberately **no message text and no
@@ -167,7 +171,7 @@ class HudController(NSObject):
         self._judged_once = False      # first judge call includes the local model load
         self._read_once = False        # first OCR call includes Vision's own load
         self._last_skip_reason = None
-        self.judge = make_judge()
+        self.judge = None if BRAND_PREVIEW else make_judge()
         self.generator = Generator()
         # 话术: per-slot tone selection. A slot on 不用 contributes no request and no rows,
         # so the panel is exactly as tall as the groups actually in use.
@@ -214,7 +218,7 @@ class HudController(NSObject):
         # title bar above a white panel.
         self.panel.setAppearance_(NSAppearance.appearanceNamed_(AppKit.NSAppearanceNameAqua))
         self.panel.setBackgroundColor_(PALETTE["bg"])
-        self.panel.setTitle_("jev-jarvis")
+        self.panel.setTitle_(brand.APP_NAME)
         self.panel.setHidesOnDeactivate_(False)
         self.panel.setBecomesKeyOnlyIfNeeded_(True)
 
@@ -234,16 +238,29 @@ class HudController(NSObject):
         # "意图识别率 100%" measures 103 px at 12 pt.
         # Every control is created once and then placed by _relayout(), which is what lets
         # the panel change height when the tone selection changes.
-        dy = 30
+        mascot = AppKit.NSImageView.alloc().initWithFrame_(NSMakeRect(0, 0, 52, 52))
+        mascot.setImage_(AppKit.NSImage.alloc().initWithContentsOfFile_(str(brand.MASCOT_PATH)))
+        mascot.setImageScaling_(AppKit.NSImageScaleProportionallyUpOrDown)
+        view.addSubview_(mascot)
+        self._fixed.append((mascot, 12, 8, 52, 52))
+        for title, top, size, color in (
+            (brand.APP_NAME, 14, 18, PALETTE["brand"]),
+            (brand.TAGLINE, 39, 10, PALETTE["muted"]),
+        ):
+            label = self._make_label(72, 0, PANEL_W - 86, 22, size=size, color=color, bold=size > 12)
+            label.setStringValue_(title)
+            view.addSubview_(label)
+            self._fixed.append((label, 72, top, PANEL_W - 86, 22))
+        dy = 72
         for key, size, color, bold, height in (
             ("chat", 12, PALETTE["green"], True, 18),      # 群名 / 联系人
             ("status", 10, PALETTE["muted"], False, 14),
-            ("message", 15, PALETTE["text"], False, 50),      # the message under analysis
+            ("message", 15, PALETTE["text"], False, 42),      # the message under analysis
             ("sender", 10, PALETTE["muted"], False, 14),
-            ("intent", 21, PALETTE["text"], True, 28),
-            ("confidence", 12, PALETTE["muted"], False, 18),
-            ("risk", 14, PALETTE["green"], True, 20),
-            ("actions", 13, PALETTE["text"], False, 18),
+            ("intent", 21, PALETTE["text"], True, 24),
+            ("confidence", 12, PALETTE["muted"], False, 16),
+            ("risk", 14, PALETTE["green"], True, 18),
+            ("actions", 12, PALETTE["text"], False, 16),
         ):
             tf = self._make_label(14, 0, PANEL_W - 28, height,
                                   size=size, color=color, bold=bold)
@@ -252,7 +269,7 @@ class HudController(NSObject):
             view.addSubview_(tf)
             self.rows[key] = tf
             self._fixed.append((tf, 14, dy, PANEL_W - 28, height))
-            dy += height + 8
+            dy += height + 6
 
         # ---- candidates section
         dy += 6
@@ -391,7 +408,7 @@ class HudController(NSObject):
         if close:
             close.setTarget_(self)
             close.setAction_("quitApp:")
-            close.setToolTip_("退出 jev-jarvis")
+            close.setToolTip_(f"退出 {brand.APP_NAME}")
         if mini:
             mini.setTarget_(self)
             mini.setAction_("collapsePanel:")
@@ -404,8 +421,8 @@ class HudController(NSObject):
         """Menu-bar item — the standard place for a background helper's controls."""
         bar = AppKit.NSStatusBar.systemStatusBar()
         self.status_item = bar.statusItemWithLength_(AppKit.NSVariableStatusItemLength)
-        self.status_item.button().setTitle_("J")
-        self.status_item.button().setToolTip_("jev-jarvis · 微信意图助手")
+        self.status_item.button().setTitle_("哑巴")
+        self.status_item.button().setToolTip_(brand.APP_NAME + " · " + brand.TAGLINE)
 
         menu = AppKit.NSMenu.alloc().init()
         for title, action, key in (
@@ -415,7 +432,7 @@ class HudController(NSObject):
         ):
             menu.addItemWithTitle_action_keyEquivalent_(title, action, key)
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
-        menu.addItemWithTitle_action_keyEquivalent_("退出 jev-jarvis", "quitApp:", "q")
+        menu.addItemWithTitle_action_keyEquivalent_(f"退出 {brand.APP_NAME}", "quitApp:", "q")
         for item in menu.itemArray():
             item.setTarget_(self)
         self.pause_item = menu.itemArray()[1]
@@ -627,6 +644,8 @@ class HudController(NSObject):
 
     @objc.python_method
     def _regenerate(self):
+        if BRAND_PREVIEW:
+            return
         """Re-run just the generation half for the message on screen.
 
         No re-judging and no re-reading of the screen: the intent and risk do not depend on
@@ -763,6 +782,8 @@ class HudController(NSObject):
 
     # --------------------------------------------------------------- loop
     def tick_(self, timer):
+        if BRAND_PREVIEW:
+            return
         if self._busy or self._paused:
             return  # paused, or a previous tick is still running
         self._busy = True
@@ -1029,7 +1050,7 @@ def warn_if_no_generation_key() -> None:
         'display alert "生成层还没配 Key，候选回复会是空的" message "'
         "意图和风险判断不受影响 —— 那部分跑在本地模型上，不需要 Key。\\n\\n"
         f"在下面的文件里填这两组中的任意一组（二选一即可），然后重启本应用：\\n{path}\\n\\n"
-        "    OPENAI_API_KEY      （任意 OpenAI 兼容端点，如 DeepSeek）\\n"
+        "    OPENAI_API_KEY      （任意 OpenAI 兼容端点，如 GPT 服务）\\n"
         '    ANTHROPIC_API_KEY   （任意 Anthropic 兼容端点，如智谱）" as informational'
     )
     try:
@@ -1042,6 +1063,21 @@ def warn_if_no_generation_key() -> None:
 def main() -> None:
     app = AppKit.NSApplication.sharedApplication()
     app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+    if BRAND_PREVIEW:
+        app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyRegular)
+        controller = HudController.alloc().init()
+        controller._paused = True
+        controller._render("chat", "品牌界面预览", PALETTE["brand"])
+        controller._render("status", "未读取微信 · 未调用模型", PALETTE["muted"])
+        controller._render("message", "不用急着回，先想一句像你的。", PALETTE["text"])
+        controller._render("intent", "等你开口", PALETTE["text"])
+        controller._render("actions", "选好回复后，由你发送。", PALETTE["muted"])
+        controller.rows["cand_header"].setStringValue_("回复候选将在连接后出现")
+        controller.panel.center()
+        controller._show()
+        app.activateIgnoringOtherApps_(True)
+        app.run()
+        return
     warn_if_no_generation_key()
     controller = HudController.alloc().init()
     # First line of every run: which backends are actually in play. Support requests

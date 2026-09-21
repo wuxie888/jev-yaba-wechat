@@ -99,6 +99,8 @@ def _endpoint(base: str, api: str) -> str:
     So: if the base already ends in a version segment, append only the path.
     """
     b = (base or "").rstrip("/")
+    if api == "responses":
+        return b if b.endswith("/responses") else b + "/responses"
     last = b.rsplit("/", 1)[-1].lower()
     has_version = bool(re.fullmatch(r"v\d+[a-z]*", last))
     if api == "anthropic":
@@ -114,7 +116,7 @@ def pick_api_format(base: str, configured: str | None) -> str:
     """
     if configured:
         c = configured.strip().lower()
-        if c in ("openai", "anthropic"):
+        if c in ("openai", "anthropic", "responses"):
             return c
     return "anthropic" if "anthropic" in (base or "").lower() else "openai"
 
@@ -134,7 +136,7 @@ def load_credentials() -> tuple[str, str, str, str, str]:
 
     if oai["key"]:
         base = oai["base"] or DEFAULT_OPENAI_BASE
-        return base, oai["key"], oai["model"] or DEFAULT_MODEL, oai["source"], pick_api_format(base, None)
+        return base, oai["key"], oai["model"] or DEFAULT_MODEL, oai["source"], pick_api_format(base, userconfig.get("OPENAI_API_FORMAT"))
     if anth["key"]:
         base = anth["base"] or DEFAULT_ANTHROPIC_BASE
         return base, anth["key"], anth["model"] or DEFAULT_MODEL, anth["source"], pick_api_format(base, None)
@@ -147,7 +149,7 @@ def load_credentials() -> tuple[str, str, str, str, str]:
 def credential_status() -> str:
     """Human-readable state for --check; the key itself is never printed."""
     base, key, model, source, api = load_credentials()
-    shape = ("Anthropic 格式 /v1/messages" if api == "anthropic"
+    shape = ("Responses 格式 /responses" if api == "responses" else "Anthropic 格式 /v1/messages" if api == "anthropic"
              else "OpenAI 格式 /v1/chat/completions")
     home = str(Path.home())
     if not key:
@@ -166,7 +168,7 @@ class Generator:
     def __init__(self, model: str | None = None, timeout: int = 30,
                  api: str | None = None):
         self.model_override = model
-        self.api_override = api if api in ("openai", "anthropic") else None
+        self.api_override = api if api in ("openai", "anthropic", "responses") else None
         self.timeout = timeout
         self._creds: tuple[str, str, str] | None = None
         self._last_url = ""
@@ -185,6 +187,21 @@ class Generator:
             model = self.model_override
         if self.api_override:
             api = self.api_override
+        if api == "responses":
+            url = _endpoint(base, "responses")
+            body = {"model": model, "input": [{"role": "user", "content": prompt}],
+                    "max_output_tokens": 2048, "store": False}
+            headers = {"content-type": "application/json", "authorization": f"Bearer {key}"}
+            data = self._post(url, headers, body)
+            if data.get("error") or data.get("status") in ("failed", "incomplete", "cancelled"):
+                raise ValueError("GPT 未完成回复，请重试或检查模型配置")
+            parts = [part.get("text", "")
+                     for item in data.get("output", []) if item.get("type") == "message"
+                     for part in item.get("content", []) if part.get("type") == "output_text"]
+            text = "\n".join(parts).strip()
+            if not text:
+                raise ValueError("GPT 未返回回复正文")
+            return text
         if api == "anthropic":
             url = _endpoint(base, "anthropic")
             body = {"model": model, "max_tokens": 300, "temperature": 0.9,

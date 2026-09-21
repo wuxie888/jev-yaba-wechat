@@ -8,7 +8,7 @@
 # published silently.
 #
 # Usage:
-#   ./packaging/release.sh                     # -> dist/jev-jarvis-<version>-macos.zip + SHA256SUMS
+#   ./packaging/release.sh                     # -> dist/jev-yaba-wechat-<version>-macos.zip + SHA256SUMS
 #   ./packaging/release.sh --out /tmp/rel      # somewhere else
 #   ./packaging/release.sh --sign "Developer ID Application: X (TEAM)"
 #                                              # 有开发者证书才用；--sign - 是 ad-hoc（不解决 Gatekeeper）
@@ -30,7 +30,7 @@ while [ $# -gt 0 ]; do
         --out)     OUT="${2:-}";     [ -n "$OUT" ]    || { echo "--out 需要目录" >&2; exit 2; }; shift 2 ;;
         --sign)    SIGN="${2:-}";    [ -n "$SIGN" ]   || { echo "--sign 需要证书名（ad-hoc 写 -）" >&2; exit 2; }; shift 2 ;;
         --target)  TARGET="${2:-}";  [ -n "$TARGET" ] || { echo "--target 需要提交/分支名" >&2; exit 2; }; shift 2 ;;
-        --publish) PUBLISH=1; shift ;;
+        --publish) echo "本品牌尚未配置发布仓库，仅支持本机打包。" >&2; exit 2 ;;
         -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
         *) echo "未知参数：$1（--help 看用法）" >&2; exit 2 ;;
     esac
@@ -55,7 +55,7 @@ fi
 
 echo "==> 构建 .app"
 "$ROOT/packaging/build_app.sh"
-APP="$ROOT/jev-jarvis.app"
+APP="$ROOT/jev-哑巴微信.app"
 
 # the zip carries whatever is on disk, so say it out loud when that is not a commit
 if [ -n "$(git -C "$ROOT" status --porcelain)" ]; then
@@ -72,10 +72,10 @@ else
     echo "==> 跳过签名（本机没有开发者证书）"
 fi
 
-ZIP="$OUT/jev-jarvis-$VERSION-macos.zip"
+ZIP="$OUT/jev-yaba-wechat-$VERSION-macos.zip"
 rm -f "$ZIP"
 echo "==> 压缩"
-# --keepParent: the zip must contain jev-jarvis.app/ itself, so unzipping gives an app
+# --keepParent: the zip must contain jev-哑巴微信.app/ itself, so unzipping gives an app
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
 ( cd "$OUT" && shasum -a 256 "$(basename "$ZIP")" > SHA256SUMS )
 
@@ -91,11 +91,11 @@ check() {
     fi
     echo "    ✓ $1"
 }
-check "解压得到 jev-jarvis.app"      "[ -d '$TMP/jev-jarvis.app' ]"
-check "启动器带可执行权限"            "[ -x '$TMP/jev-jarvis.app/Contents/MacOS/jev-jarvis' ]"
-check "Info.plist 合法"             "plutil -lint '$TMP/jev-jarvis.app/Contents/Info.plist'"
-check "图标在"                      "[ -f '$TMP/jev-jarvis.app/Contents/Resources/AppIcon.icns' ]"
-check "包内 Python 版本已钉住"        "[ -f '$TMP/jev-jarvis.app/Contents/Resources/app/.python-version' ]"
+check "解压得到 jev-哑巴微信.app"      "[ -d '$TMP/jev-哑巴微信.app' ]"
+check "启动器带可执行权限"            "[ -x '$TMP/jev-哑巴微信.app/Contents/MacOS/jev-yaba-wechat' ]"
+check "Info.plist 合法"             "plutil -lint '$TMP/jev-哑巴微信.app/Contents/Info.plist'"
+check "图标在"                      "[ -f '$TMP/jev-哑巴微信.app/Contents/Resources/AppIcon.icns' ]"
+check "包内 Python 版本已钉住"        "[ -f '$TMP/jev-哑巴微信.app/Contents/Resources/app/.python-version' ]"
 
 echo "==> 完成"
 du -sh "$ZIP" | awk '{print "    zip 体积: " $1}'
@@ -112,11 +112,11 @@ if [ "$PUBLISH" = 1 ]; then
     fi
     NOTES="$TMP/notes.md"
     {
-        echo "需要 **macOS 13+**。下载即用：解压后把 \`jev-jarvis.app\` 拖进「应用程序」。"
+        echo "需要 **macOS 13+**。下载即用：解压后把 \`jev-哑巴微信.app\` 拖进「应用程序」。"
         echo
         echo "**第一次打开**：右键（或按住 Control 点）→ 打开 → 再点「打开」。未做 Apple 公证，双击会被 Gatekeeper 拦，只需这一次。"
         echo "**第一次启动**：联网装依赖（uv 缓存命中就很快）；**按提示授予「屏幕录制」权限，然后退出重开**。"
-        echo "**判断层默认跑本地模型，首次要下载约 7GB**（之后离线可用）。不想下这么大：在 \`~/.config/jev-jarvis/env\` 里给判断层配一个 key 走云端，见 README「配置」。"
+        echo "**判断层默认跑本地模型，首次要下载约 7GB**（之后离线可用）。不想下这么大：在 \`~/.config/jev-yaba-wechat/env\` 里给判断层配一个 key 走云端，见 README「配置」。"
         echo
         echo "### 本次包含"
         PREV="$(git -C "$ROOT" describe --tags --abbrev=0 2>/dev/null || true)"
@@ -126,7 +126,7 @@ if [ "$PUBLISH" = 1 ]; then
             git -C "$ROOT" log --pretty='- %s' | head -20
         fi
     } > "$NOTES"
-    RELEASE_ARGS=("$TAG" "$ZIP" "$OUT/SHA256SUMS" --title "jev-jarvis $TAG" --notes-file "$NOTES")
+    RELEASE_ARGS=("$TAG" "$ZIP" "$OUT/SHA256SUMS" --title "jev-哑巴微信 $TAG" --notes-file "$NOTES")
     # pin the tag: without --target gh tags the default branch tip, which may have moved
     # since the zip was built
     [ -n "$TARGET" ] && RELEASE_ARGS+=(--target "$TARGET")
@@ -134,7 +134,5 @@ if [ "$PUBLISH" = 1 ]; then
     echo "    已发布 $TAG"
 else
     echo
-    echo "    下一步（发 GitHub Release）："
-    echo "      gh release create v$VERSION \"$ZIP\" \"$OUT/SHA256SUMS\" --title \"jev-jarvis v$VERSION\" --generate-notes"
-    echo "    或直接重跑：./packaging/release.sh --publish"
+    echo "    已完成本机品牌包；未配置或执行远程发布。"
 fi

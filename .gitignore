@@ -68,3 +68,7 @@ htmlcov/
 .vscode/
 *.sublime-*
 .history/
+
+# Versioned brand artwork (never chat screenshots)
+!assets/brand/*.png
+.brand-preview-venv/
