@@ -256,6 +256,86 @@ def ocr_image(image, languages=("zh-Hans",), chat_only: bool = True) -> list[Tex
     return _vision_blocks(handler, languages, chat_only)
 
 
+def warm_ocr() -> float:
+    """Pay Vision's one-off recognition-model load on a blank canvas, not a real read.
+
+    The first text recognition in a process costs ~2x steady state (~0.7 s vs ~250 ms)
+    while Vision loads its recognition model. Running that first request on a small white
+    image needs no WeChat window at all — it works even when WeChat starts after this
+    app — so the read loop's first real read finds the framework already paid for.
+    Returns the elapsed milliseconds, or -1.0 when the request itself failed.
+    """
+    cs = Quartz.CGColorSpaceCreateDeviceRGB()
+    ctx = Quartz.CGBitmapContextCreate(
+        None, 64, 64, 8, 64 * 4, cs, Quartz.kCGImageAlphaPremultipliedLast)
+    Quartz.CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 1.0)
+    Quartz.CGContextFillRect(ctx, Quartz.CGRectMake(0, 0, 64, 64))
+    image = Quartz.CGBitmapContextCreateImage(ctx)
+    t0 = time.perf_counter()
+    try:
+        ocr_image(image, chat_only=False)
+    except Exception:
+        return -1.0
+    return (time.perf_counter() - t0) * 1000
+
+
+# ----------------------------------------------------------------- fingerprint
+
+# Fixed grid, independent of window size: a resize re-fingerprints as "different" instead
+# of aliasing onto a match. At 128x224 a single chat character still covers a handful of
+# cells, so the smallest change anyone could send shifts far more bytes than noise.
+_FP_W, _FP_H = 128, 224
+
+
+def _fingerprint(image) -> bytes | None:
+    """The chat pane (title band down to just above the input box) as a small grayscale
+    thumbnail; None when anything in the pipeline refuses.
+
+    read_conversation() compares this between ticks: the same picture means the pixels
+    did not move, so OCR cannot have anything new to report and its ~300 ms can be
+    skipped. The input box is excluded on purpose — the caret blinks there, and it would
+    keep a quiet screen looking busy forever. The chat list is excluded for the same
+    reason (unread badges), which is also why the crop starts at CHAT_PANE_X_MIN.
+    """
+    import ctypes
+
+    try:
+        w = Quartz.CGImageGetWidth(image)
+        h = Quartz.CGImageGetHeight(image)
+        # Layout constants here are bottom-origin (Vision's convention); CGImage cropping
+        # is top-origin, so the band "input-area top edge .. window top" becomes
+        # y=0 .. (1 - INPUT_AREA_Y_MIN) from the top.
+        crop = Quartz.CGImageCreateWithImageInRect(
+            image,
+            Quartz.CGRectMake(int(CHAT_PANE_X_MIN * w), 0,
+                              int((1.0 - CHAT_PANE_X_MIN) * w),
+                              int((1.0 - INPUT_AREA_Y_MIN) * h)))
+        cs = Quartz.CGColorSpaceCreateDeviceGray()
+        buf = ctypes.create_string_buffer(_FP_W * _FP_H)
+        ctx = Quartz.CGBitmapContextCreate(
+            buf, _FP_W, _FP_H, 8, _FP_W, cs, Quartz.kCGImageAlphaNone)
+        Quartz.CGContextDrawImage(ctx, Quartz.CGRectMake(0, 0, _FP_W, _FP_H), crop)
+        return buf.raw
+    except Exception:
+        return None
+
+
+def _same_frame(a: bytes | None, b: bytes | None) -> bool:
+    """True when two fingerprints are the same picture.
+
+    Exact equality covers the static case at C speed. When it fails, a tolerant count
+    decides: a few small byte deltas is rendering noise (treat as same, skip OCR),
+    anything a person sent rewrites whole glyph cells (treat as changed). Missing a real
+    change would mean missing a message, so the threshold sits well under what one
+    character produces.
+    """
+    if a is None or b is None:
+        return False
+    if a == b:
+        return True
+    return sum(1 for x, y in zip(a, b) if abs(x - y) >= 8) < 6
+
+
 # ---------------------------------------------------------------------- extraction
 
 
@@ -377,8 +457,17 @@ def looks_like_sender_name(msg: Message, following: Message | None) -> bool:
 # ---------------------------------------------------------------------- public API
 
 
-def read_conversation(max_messages: int = 12, previous_wid: int | None = None) -> dict:
-    """One-shot read: find window -> capture -> OCR -> messages."""
+def read_conversation(max_messages: int = 12, previous_wid: int | None = None,
+                      prev_fingerprint: bytes | None = None) -> dict:
+    """One-shot read: find window -> capture -> OCR -> messages.
+
+    Pass the previous call's "fingerprint" and an unchanged chat pane short-circuits
+    before OCR: ok=True with "unchanged": True, empty messages, and the window's current
+    geometry — the caller reuses what it last read and keeps positioning from fresh
+    coordinates. The fingerprint only exists on the in-process capture path; the
+    subprocess fallback returns fingerprint=None, which never matches (a permanently
+    slower read stays visible instead of silently skipping).
+    """
     t0 = time.perf_counter()
     win = find_wechat_window(previous_wid)
     if win is None:
@@ -388,6 +477,16 @@ def read_conversation(max_messages: int = 12, previous_wid: int | None = None) -
     # The subprocess + PNG route stays as the fallback: it is ~150 ms slower, but it is the
     # one that still worked when CGWindowListCreateImage had nothing to give.
     image = capture_image(win.wid)
+    fingerprint = _fingerprint(image) if image is not None else None
+    window = {"wid": win.wid, "title": win.title, "w": win.w, "h": win.h,
+              "x": win.x, "y": win.y}
+    if _same_frame(fingerprint, prev_fingerprint):
+        total = (time.perf_counter() - t0) * 1000
+        return {"ok": True, "unchanged": True, "messages": [], "fingerprint": fingerprint,
+                "chat_title": "", "window": window, "n_blocks": 0,
+                "timing_ms": {"capture": total, "ocr": 0.0, "total": total,
+                              "capture_path": "memory"}}
+
     t_cap = time.perf_counter()
     capture_path = "memory" if image is not None else "subprocess"
     if image is not None:
@@ -405,13 +504,14 @@ def read_conversation(max_messages: int = 12, previous_wid: int | None = None) -
     msgs = extract_messages(blocks, max_messages=max_messages)
     return {
         "ok": True,
+        "unchanged": False,
         "chat_title": extract_chat_title(blocks),
-        "window": {"wid": win.wid, "title": win.title, "w": win.w, "h": win.h,
-                   "x": win.x, "y": win.y},
+        "window": window,
         "messages": msgs,
         "timing_ms": {"capture": (t_cap - t0) * 1000, "ocr": (t_ocr - t_cap) * 1000,
                       "total": (t_ocr - t0) * 1000, "capture_path": capture_path},
         "n_blocks": len(blocks),
+        "fingerprint": fingerprint,
     }
 
 

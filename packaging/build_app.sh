@@ -161,6 +161,7 @@ chmod +x "$APP/Contents/MacOS/jev-yaba-wechat"
 
 echo "==> 生成图标"
 PY="$ROOT/.venv/bin/python"
+# Brand icons use only the Python standard library, sips and iconutil.
 [ -x "$PY" ] || PY="$(command -v python3)"
 "$PY" "$ROOT/packaging/make_icon.py" "$APP/Contents/Resources/AppIcon.iconset"
 iconutil -c icns "$APP/Contents/Resources/AppIcon.iconset" -o "$APP/Contents/Resources/AppIcon.icns"

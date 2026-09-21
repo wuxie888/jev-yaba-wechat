@@ -44,5 +44,34 @@ class ResponsesContract(unittest.TestCase):
     def test_legacy_chat_endpoint_preserved(self):
         self.assertEqual(generate._endpoint('https://example.com/v1','openai'),'https://example.com/v1/chat/completions')
 
+    def test_reasoning_only_errors_reach_panel_for_all_transports(self):
+        fixtures = {
+            'responses': {'status': 'incomplete', 'output': [{'type': 'reasoning'}]},
+            'openai': {'choices': [{'message': {'content': '', 'reasoning_content': 'private reasoning'}}]},
+            'anthropic': {'content': [{'type': 'thinking', 'thinking': 'private reasoning'}]},
+        }
+        for api, data in fixtures.items():
+            with self.subTest(api=api):
+                creds = ('https://example.com/v1', 'synthetic-test-key', 'gpt-test', 'test', api)
+                with patch.object(generate, 'load_credentials', return_value=creds), patch.object(generate.Generator, '_post', return_value=data):
+                    result = generate.Generator().generate('虚构消息', slot_tones=list(generate.styles.BUILTIN)[:2])
+                self.assertTrue(all(not group['texts'] for group in result['groups']))
+                self.assertIn('gpt-test', result['error'])
+                self.assertIn('未生成回复正文', result['error'])
+                self.assertNotIn('private reasoning', result['error'])
+                self.assertNotIn('deepseek', result['error'].lower())
+                self.assertEqual(result['error'].count('gpt-test'), 1)
+
+    def test_incomplete_response_never_becomes_sendable_candidate(self):
+        with self.assertRaises(ValueError):
+            self.call({'status': 'incomplete', 'output': [
+                {'type': 'message', 'content': [{'type': 'output_text', 'text': '尚未完成的回复'}]}]})
+
+    def test_chat_answer_excludes_reasoning_and_keeps_text(self):
+        creds = ('https://example.com/v1', 'synthetic-test-key', 'gpt-test', 'test', 'openai')
+        data = {'choices': [{'message': {'content': '收到，我确认一下。', 'reasoning': 'private reasoning'}}]}
+        with patch.object(generate, 'load_credentials', return_value=creds), patch.object(generate.Generator, '_post', return_value=data):
+            self.assertEqual(generate.Generator()._call('虚构消息'), '收到，我确认一下。')
+
 if __name__ == '__main__':
     unittest.main()

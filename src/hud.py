@@ -58,7 +58,8 @@ import userconfig  # noqa: E402
 
 userconfig.load()   # ~/.config/jev-yaba-wechat/env -> os.environ (Finder apps inherit none)
 
-from perception import read_conversation, screen_capture_ok, request_screen_capture  # noqa: E402
+from perception import (  # noqa: E402
+    read_conversation, screen_capture_ok, request_screen_capture, warm_ocr)
 from judge import make_judge  # noqa: E402
 from generate import Generator, load_credentials  # noqa: E402
 import styles  # noqa: E402
@@ -68,9 +69,14 @@ BRAND_PREVIEW = "--brand-preview" in sys.argv
 
 PANEL_W, PANEL_H = 360, 614   # tall enough for 3-line candidates + the chat name row
 COLLAPSED_H = 96              # height when the panel is rolled up
-POLL_INTERVAL = 1.0     # detection granularity
-SETTLE_S = 1.2          # wait this long with no new message before analysing (anti-flood)
-MIN_GAP_S = 2.0         # never restart analysis faster than this
+# The tick timer fires at FAST_TICK; a read only runs when due. A quiet screen (fingerprint
+# match ⇒ no OCR) re-checks every FAST_TICK — a new message surfaces within 0.25 s instead
+# of within 1 s — while a moving screen (someone typing a burst) pays the full capture+OCR
+# per read and drops back to SLOW_TICK, the cadence the old fixed poll had.
+FAST_TICK = 0.25         # re-check cadence while the chat pane is quiet
+SLOW_TICK = 1.0          # re-check cadence while the chat pane is moving
+SETTLE_S = 1.2           # wait this long with no new message before analysing (anti-flood)
+MIN_GAP_S = 2.0          # never restart analysis faster than this
 CONTEXT_TURNS = 4       # how many recent turns both halves get to see
 
 
@@ -189,6 +195,19 @@ class HudController(NSObject):
         self._last_intent = ""          # kept so a tone change can re-rank without re-judging
 
         self._busy = False
+        self._next_read_ts = 0.0    # reads before this timestamp are skipped (quiet screen)
+        self._fingerprint = None    # last chat-pane fingerprint; equal ⇒ skip OCR entirely
+        self._last_full = None      # last OCR'd result, reused while the pane is unchanged
+        self._analyzing = False     # judge+generate runs off the tick path
+        # Pre-judgment: the local judge starts the moment a new message is seen, and the
+        # settle gate consumes the verdict if the text is unchanged — intent/risk land on
+        # screen ~1 s earlier and only the (paid) generation half still waits. Single-slot
+        # request = latest-wins: a newer text overwrites the slot and retires the verdict.
+        self._model_lock = threading.Lock()   # never two local forwards (judge/rank) at once
+        self._prejudge_req = None             # latest-wins slot: (text, context, sender, prev)
+        self._prejudge_result = None          # (text, verdict, sender, prev), spent at settle
+        self._prejudging = False              # a pre-judge forward is running right now
+        self._prejudge_event = threading.Event()
         self._collapsed = False
         self._expanded_h = None       # full height, captured the first time we collapse
         self._paused = False
@@ -199,6 +218,8 @@ class HudController(NSObject):
         self._pending_origin = None   # candidate origin awaiting confirmation
         self._build_panel()
         self._expanded_h = self.panel.frame().size.height
+        if not BRAND_PREVIEW:
+            threading.Thread(target=self._prejudge_loop, daemon=True).start()
         return self
 
     # ------------------------------------------------------------------ ui
@@ -682,8 +703,9 @@ class HudController(NSObject):
         scores: dict[str, float] = {}
         if intent:
             try:
-                scores = {r["text"]: r["prob"] for r in
-                          self.judge.rank_candidates(message, intent, texts)}
+                with self._model_lock:   # never two local forwards at once
+                    ranked = self.judge.rank_candidates(message, intent, texts)
+                scores = {r["text"]: r["prob"] for r in ranked}
             except Exception:
                 scores = {}
         payload = []
@@ -727,6 +749,8 @@ class HudController(NSObject):
         self._paused = not self._paused
         self.pause_item.setTitle_("继续读屏" if self._paused else "暂停读屏")
         if self._paused:
+            self._prejudge_req = None        # a paused app judges nothing further
+            self._prejudge_result = None
             self._render("status", "已暂停 · 不再读屏", PALETTE["amber"])
             self._render("message", "", PALETTE["text"])
             self._render("sender", "", PALETTE["muted"])
@@ -737,11 +761,14 @@ class HudController(NSObject):
             self.rows["cand_header"].setStringValue_("")
             self._clear_candidates()
         else:
+            self._prejudge_result = None
             self.last_seen = None      # force a fresh read of whatever is on screen
             self.analyzed_text = None
             self._render("status", "已恢复 · 读屏中", PALETTE["muted"])
 
     def reanalyze_(self, sender):
+        self._prejudge_req = None      # "re-analyze" means re-run, not reuse the pre-judge
+        self._prejudge_result = None
         self.last_seen = None
         self.analyzed_text = None
         self._render("status", "重新分析中…", PALETTE["muted"])
@@ -784,8 +811,8 @@ class HudController(NSObject):
     def tick_(self, timer):
         if BRAND_PREVIEW:
             return
-        if self._busy or self._paused:
-            return  # paused, or a previous tick is still running
+        if self._paused or self._busy or time.time() < self._next_read_ts:
+            return  # paused, a previous read is still running, or not due yet
         self._busy = True
         threading.Thread(target=self._work, daemon=True).start()
 
@@ -803,21 +830,38 @@ class HudController(NSObject):
                 self._asked_permission = True
                 request_screen_capture()      # opens the system prompt
             self._push("applyError:", "需要屏幕录制权限 · 系统设置 › 隐私与安全性")
+            self._next_read_ts = time.time() + SLOW_TICK
             return
         try:
-            res = read_conversation(previous_wid=self._win_wid)
+            res = read_conversation(previous_wid=self._win_wid,
+                                    prev_fingerprint=self._fingerprint)
         except Exception as e:
             self._push("applyError:", f"读取失败: {type(e).__name__}: {str(e)[:40]}")
+            self._next_read_ts = time.time() + SLOW_TICK
             return
         if not res["ok"]:
             self._push("applyError:", f"{res['error']} · 微信没开或窗口被最小化？")
+            self._next_read_ts = time.time() + SLOW_TICK
             return
 
+        # Same fingerprint ⇒ same pixels ⇒ the messages are exactly what we last read.
+        # Cadence follows the screen: quiet checks back in FAST_TICK (capture+hash only,
+        # ~30 ms), moving screens just paid a full OCR and get SLOW_TICK like before.
+        self._fingerprint = res.get("fingerprint")
+        self._next_read_ts = time.time() + (FAST_TICK if res["unchanged"] else SLOW_TICK)
+
         # position immediately: analysis takes seconds, and a delayed correction
-        # showed up as a visible jump after the verdict landed
+        # showed up as a visible jump after the verdict landed. Pushed on unchanged
+        # frames too — the window can move while its pixels stay identical.
         self._win_wid = res["window"]["wid"]
-        self._push("applyChat:", res.get("chat_title") or "")
         self._push("applyPosition:", res["window"])
+        if res["unchanged"] and self._last_full is not None:
+            # the settle/analyze gate below still runs every read; an unchanged frame
+            # just skips re-deriving the messages it would act on
+            res = self._last_full
+        else:
+            self._last_full = res
+            self._push("applyChat:", res.get("chat_title") or "")
 
         msgs = res["messages"]
         if not msgs:
@@ -848,27 +892,127 @@ class HudController(NSObject):
             _log(f"读屏 抓取 {t.get('capture', 0):.0f}ms + OCR {t.get('ocr', 0):.0f}ms"
                  f" = {t.get('total', 0):.0f}ms · 读到 {len(msgs)} 条（对方 {len(thems)} 条）"
                  f"{note}{slow_cap}")
-            _log(f"新消息 · 等停稳 {SETTLE_S}s 再分析（两次分析最小间隔 {MIN_GAP_S}s）")
+            _log(f"新消息 · 预判先跑，停稳 {SETTLE_S}s 后上屏（两次完整分析最小间隔 {MIN_GAP_S}s）")
+            # latest-wins: overwrite the slot, retire the old verdict — only the newest
+            # text's judgment can ever be consumed, and only by the settle gate below
+            self._prejudge_req = (newest.text, self._context_text(msgs, newest),
+                                  newest.sender, prev_text)
+            self._prejudge_result = None
+            self._prejudge_event.set()
             # keep the previous verdict readable; just badge that something new landed
             self._push("applyIncoming:", (newest.text, newest.sender, prev_text))
 
         settled = (now - self.last_change_ts) >= SETTLE_S
         cooled = (now - self.last_analyze_ts) >= MIN_GAP_S
-        if newest.text != self.analyzed_text and settled and cooled:
+        pr = self._prejudge_result
+        pre_hit = pr is not None and pr[0] == newest.text
+        # A pre-judged verdict needs no cooling: its cost was already paid per arrival.
+        # Only the full path (no usable pre-judgment) still waits MIN_GAP_S out.
+        if (newest.text != self.analyzed_text and settled and not self._analyzing
+                and not self._prejudging and (pre_hit or cooled)):
             self.last_analyze_ts = now
             self.analyzed_text = newest.text
-            _log(f"开始分析 · 这条消息出现到现在 {now - self.last_change_ts:.1f}s")
-            self._push("applyPending:", (newest.text, newest.sender, prev_text))
-            self._analyze(newest, msgs, prev_text)
+            self._prejudge_result = None      # spent: a verdict is shown exactly once
+            self._analyzing = True
+            if pre_hit:
+                # Judgment already ran inside the settle window; go straight to the
+                # verdict on screen and start only the generation half.
+                _log(f"停稳 · 用预判结论上屏 · 这条消息出现到现在 {now - self.last_change_ts:.1f}s")
+                self._push("applyJudgment:", (pr[1], pr[2], pr[3]))
+                threading.Thread(target=self._run_generation,
+                                 args=(newest, msgs, pr[1]), daemon=True).start()
+            else:
+                _log(f"开始分析 · 这条消息出现到现在 {now - self.last_change_ts:.1f}s")
+                self._push("applyPending:", (newest.text, newest.sender, prev_text))
+                # off the tick path on purpose: judge+generate+rank takes over a second, and
+                # while it runs the loop must keep reading — a message landing mid-analysis
+                # used to wait the whole analysis out before anyone even saw it
+                threading.Thread(target=self._run_analysis,
+                                 args=(newest, msgs, prev_text), daemon=True).start()
         elif newest.text != self.analyzed_text:
             # the wait is deliberate; say so once per arrival change so "it feels slow" can
             # be told apart from "it is still waiting out the burst window"
-            why = "消息还在变" if not settled else f"距上次分析不足 {MIN_GAP_S}s"
+            why = ("消息还在变" if not settled else
+                   "上一条还在分析" if self._analyzing else
+                   "预判还在跑" if self._prejudging else
+                   f"距上次分析不足 {MIN_GAP_S}s")
             if self._last_skip_reason != why:
                 self._last_skip_reason = why
                 _log(f"暂不分析（{why}）")
         else:
             self._last_skip_reason = None
+
+    @objc.python_method
+    def _run_analysis(self, newest, msgs, prev_text: str):
+        try:
+            self._analyze(newest, msgs, prev_text)
+        except Exception as e:
+            _log(f"分析失败 {type(e).__name__}: {str(e)[:60]}")
+            self._push("applyError:", f"分析失败: {type(e).__name__}: {str(e)[:40]}")
+        finally:
+            self._analyzing = False
+
+    @objc.python_method
+    def _prejudge_loop(self):
+        """Judge a message the moment it is seen, so the settle gate can skip the wait.
+
+        One resident worker serializes the passes (a forward takes ~1 s). The request slot
+        holds only the newest text, so a burst queues one judgment, not one per tick, and a
+        verdict survives only if its text is still the newest when the pass ends
+        (latest-wins — checked before and after). Nothing is drawn here: the settle gate in
+        _work_inner is the only place a verdict reaches the panel, so a stale conclusion
+        cannot be shown no matter how the timing lands.
+        """
+        while True:
+            try:
+                self._prejudge_event.wait()
+                self._prejudge_event.clear()
+                req = self._prejudge_req
+                self._prejudge_req = None
+                if req is None:
+                    continue
+                text, context, sender, prev = req
+                if self._paused or text != self.last_seen:
+                    continue          # superseded while queued: only the newest text counts
+                self._prejudging = True
+                try:
+                    t0 = time.perf_counter()
+                    with self._model_lock:
+                        verdict = self.judge.judge(text, context=context)
+                    ms = (time.perf_counter() - t0) * 1000
+                    first = not self._judged_once
+                    self._judged_once = True
+                    note = "（首次，含本地模型加载）" if first else ""
+                    _log(f"预判 {ms:.0f}ms → {verdict.get('intent', '?')}"
+                         f" 把握 {verdict.get('confidence', 0):.0%}"
+                         f" 风险 {verdict.get('risk', '?')}{note}（待停稳上屏）")
+                except Exception as e:
+                    _log(f"预判失败 {type(e).__name__}: {str(e)[:60]}")
+                    verdict = None
+                finally:
+                    self._prejudging = False
+                if verdict is not None and not self._paused and text == self.last_seen:
+                    self._prejudge_result = (text, verdict, sender, prev)
+            except Exception:
+                pass                  # a resident worker must not die on one bad request
+
+    @objc.python_method
+    def _run_generation(self, newest, msgs, verdict: dict):
+        """The pre-judged path's second half: generate + rank only, judgment already shown.
+
+        Same shape as _run_analysis minus the judge pass — the settle gate consumed the
+        pre-computed verdict, so the (paid) generation is what actually starts here.
+        """
+        t0 = time.perf_counter()
+        try:
+            context = self._context_text(msgs, newest)
+            gen = self.generator.generate(newest.text, "", list(self.slot_tones), context)
+            self._finish_generate(gen, newest, t0, verdict)
+        except Exception as e:
+            _log(f"生成失败 {type(e).__name__}: {str(e)[:60]}")
+            self._push("applyError:", f"候选生成失败: {type(e).__name__}: {str(e)[:40]}")
+        finally:
+            self._analyzing = False
 
     @objc.python_method
     def _context_text(self, msgs, newest) -> str | None:
@@ -891,7 +1035,11 @@ class HudController(NSObject):
 
     @objc.python_method
     def _analyze(self, newest, msgs, prev_text: str = ""):
-        """Judge and generate in parallel, then rank. Judgment lands on screen first."""
+        """Judge and generate in parallel, then rank. Judgment lands on screen first.
+
+        Runs on its own thread (started by _work_inner): it takes over a second and must
+        not hold the read loop hostage.
+        """
         import concurrent.futures as cf
 
         t0 = time.perf_counter()
@@ -904,7 +1052,8 @@ class HudController(NSObject):
             verdict = None
             t_judge = time.perf_counter()
             try:
-                verdict = self.judge.judge(newest.text, context=context)
+                with self._model_lock:   # never two local forwards at once
+                    verdict = self.judge.judge(newest.text, context=context)
                 ms = (time.perf_counter() - t_judge) * 1000
                 first = not self._judged_once
                 self._judged_once = True
@@ -925,23 +1074,33 @@ class HudController(NSObject):
                 _log(f"生成失败 {type(e).__name__}: {str(e)[:60]}")
                 self._push("applyError:", f"候选生成失败: {type(e).__name__}: {str(e)[:40]}")
                 return
-            groups = gen.get("groups") or []
-            failed = [f"{g['tone']}({g['error'][:40]})" for g in groups if g.get("error")]
-            _log(f"生成 {gen.get('elapsed_s', 0) * 1000:.0f}ms · {len(groups)} 个话术并发"
-                 f" → {sum(len(g['texts']) for g in groups)} 条候选"
-                 + (f" · 失败: {'; '.join(failed)}" if failed else ""))
-            intent = verdict["intent"] if verdict else ""
-            t_rank = time.perf_counter()
-            payload, err = self._grouped_payload(gen, newest.text, intent)
-            rank_ms = (time.perf_counter() - t_rank) * 1000
-            if payload is None:
-                _log(f"生成无可用候选: {err[:60]}")
-                self._push("applyError:", f"候选生成失败: {err[:60]}")
-                return
-            _log(f"排序 {rank_ms:.0f}ms（本地模型，一次前向）")
-            _log(f"端到端 {(time.perf_counter() - t0) * 1000:.0f}ms"
-                 f" · 从分析开始到候选上屏")
-            self._push("applyCandidates:", payload)
+            self._finish_generate(gen, newest, t0, verdict)
+
+    @objc.python_method
+    def _finish_generate(self, gen: dict, newest, t0: float, verdict: dict | None):
+        """Log the generation, rank it against the intent, push the candidates.
+
+        Shared by both analysis paths — the full one (judge ran here) and the pre-judged
+        one (the verdict was computed during the settle window) — so the second half of
+        the pipeline has exactly one implementation.
+        """
+        groups = gen.get("groups") or []
+        failed = [f"{g['tone']}({g['error'][:40]})" for g in groups if g.get("error")]
+        _log(f"生成 {gen.get('elapsed_s', 0) * 1000:.0f}ms · {len(groups)} 个话术并发"
+             f" → {sum(len(g['texts']) for g in groups)} 条候选"
+             + (f" · 失败: {'; '.join(failed)}" if failed else ""))
+        intent = verdict["intent"] if verdict else ""
+        t_rank = time.perf_counter()
+        payload, err = self._grouped_payload(gen, newest.text, intent)
+        rank_ms = (time.perf_counter() - t_rank) * 1000
+        if payload is None:
+            _log(f"生成无可用候选: {err[:60]}")
+            self._push("applyError:", f"候选生成失败: {err[:60]}")
+            return
+        _log(f"排序 {rank_ms:.0f}ms（本地模型，一次前向）")
+        _log(f"端到端 {(time.perf_counter() - t0) * 1000:.0f}ms"
+             f" · 从分析开始到候选上屏")
+        self._push("applyCandidates:", payload)
 
     @objc.python_method
     def _push(self, selector: str, payload=None):
@@ -1021,6 +1180,37 @@ class HudController(NSObject):
     def applyPosition_(self, win):
         self._position_near(win)
 
+    # --------------------------------------------------------------- warm-up
+    @objc.python_method
+    def _warm(self):
+        """Pay the one-off loads in the background: Vision OCR first, then the judge model.
+
+        The first real message used to carry both costs: Vision's ~0.7 s first OCR and
+        decider-2b's 9-15 s load inside its first judge(). Starting both here, right after
+        launch, moves them to idle time — the fast one first so it is ready within a
+        second, the slow one after. If a message does land mid-warm-up nothing breaks:
+        its judge() blocks on the model's load lock until the warm-up finishes, and the
+        OCR warm-up is independent of WeChat entirely (a blank canvas, not a window).
+        """
+        if BRAND_PREVIEW:
+            return
+        t0 = time.perf_counter()
+        ocr_ms = warm_ocr()
+        if ocr_ms >= 0:
+            self._read_once = True    # Vision's one-off load is paid; first read is steady-state
+            _log(f"预热 OCR 就绪 · {ocr_ms:.0f}ms")
+        else:
+            _log("预热 OCR 失败 · 首次读屏会稍慢，不影响使用")
+
+        try:
+            with self._model_lock:
+                self.judge.warm()
+        except Exception as e:
+            _log(f"预热判断模型失败 {type(e).__name__}: {str(e)[:60]}")
+        else:
+            self._judged_once = True  # same: the load is paid, the first judge is steady-state
+            _log(f"预热 判断模型就绪 · 总耗时 {(time.perf_counter() - t0) * 1000:.0f}ms")
+
 
 def warn_if_no_generation_key() -> None:
     """Say it out loud at launch when the candidate half has no key behind it.
@@ -1087,8 +1277,12 @@ def main() -> None:
          f"{'TypeSafe Jev' if userconfig.get('TYPESAFE_API_KEY') else '本地 decider-2b'}"
          f" · 生成层 {(_base + ' / ' + _model) if _key else '未配置（候选区会是空的）'}")
     controller._show()
+    # Warm the heavy one-off loads (Vision OCR, judge model) while the panel is idle, so
+    # the user's first message pays only steady-state costs. With TypeSafe Jev configured
+    # warm() is a no-op — the network path has nothing to load.
+    threading.Thread(target=controller._warm, daemon=True).start()
     timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-        POLL_INTERVAL, controller, "tick:", None, True)
+        FAST_TICK, controller, "tick:", None, True)
     AppKit.NSRunLoop.currentRunLoop().addTimer_forMode_(timer, AppKit.NSDefaultRunLoopMode)
     app.run()
 

@@ -4,6 +4,7 @@
 
 - 上游：https://github.com/jev-jarvis/jev-jarvis
 - 起始提交：f31bd7112624272644fd6889e2010b763d8e7ead
+- 最近合并提交：bacd86b555a81cca329434b3d215f4a253424e56（2026-09-22，含 v0.2.0 后续更新）
 - 原作者版权：Copyright (c) 2026 eatmoreduck
 - 上游许可证：MIT，完整原文保留在 LICENSE。
 - 本次改造：应用品牌、吉祥物、图标、浮窗视觉、独立配置目录及使用说明。
