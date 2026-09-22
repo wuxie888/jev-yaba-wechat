@@ -111,8 +111,7 @@ PALETTE = {
     "edge": _rgb(0xF0D9E5),
 }
 
-# Candidate row geometry. A row is 48 pt tall inside a 56 pt pitch, so rows keep the same
-# breathing room as before; prob and buttons share the text's bottom edge.
+# Initial control geometry; _relayout measures full-width text and puts actions below it.
 CAND_BTN_W, CAND_BTN_H, CAND_BTN_GAP = 56, 24, 4
 CAND_BTN_X = PANEL_W - 14 - (2 * CAND_BTN_W + CAND_BTN_GAP)   # 230
 # Rank/percentage label ("#3 · 100%"): NSTextField's cell insets mean the widest string
@@ -167,6 +166,11 @@ def _log(msg: str) -> None:
         pass                             # a log we cannot write is not worth breaking over
 
 
+class HUDDocumentView(NSView):
+    def isFlipped(self):
+        return True
+
+
 class HudController(NSObject):
     def init(self):
         self = objc.super(HudController, self).init()
@@ -219,6 +223,8 @@ class HudController(NSObject):
         self._win_wid = None          # sticky WeChat window id
         self._last_origin = None      # last applied panel origin
         self._pending_origin = None   # candidate origin awaiting confirmation
+        self._layouting = False
+        self._user_sized = False
         self.settings_window = None
         self._settings_open = False
         self._build_panel()
@@ -233,7 +239,8 @@ class HudController(NSObject):
         # Closable/Miniaturizable are what actually CREATE the standard window buttons;
         # NonactivatingPanel alone gives a title bar with no controls at all.
         style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
-                 | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskNonactivatingPanel)
+                 | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskNonactivatingPanel
+                 | AppKit.NSWindowStyleMaskResizable)
         self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, PANEL_W, PANEL_H), style, NSBackingStoreBuffered, False)
         self.panel.setLevel_(AppKit.NSFloatingWindowLevel)
@@ -247,8 +254,12 @@ class HudController(NSObject):
         self.panel.setTitle_(brand.APP_NAME)
         self.panel.setHidesOnDeactivate_(False)
         self.panel.setBecomesKeyOnlyIfNeeded_(True)
+        self.panel.setDelegate_(self)
+        self.panel.setContentMinSize_(NSMakeSize(360, 210))
+        screen = NSScreen.mainScreen().visibleFrame()
+        self.panel.setMaxSize_(NSMakeSize(min(900, screen.size.width), screen.size.height))
 
-        view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, PANEL_W, PANEL_H))
+        view = HUDDocumentView.alloc().initWithFrame_(NSMakeRect(0, 0, PANEL_W, PANEL_H))
         # Paint the panel colour on the view itself rather than leaning on the window's
         # background colour: _relayout() grows and shrinks this view, and a region that
         # appears after a resize is not reliably covered by the window behind it. It also
@@ -364,7 +375,16 @@ class HudController(NSObject):
                                   "btn": copy_btn, "fill_btn": fill_btn})
             self._rows.append(slot_rows)
 
-        self.panel.setContentView_(view)
+        self.document = view
+        self.scroll = AppKit.NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 0, PANEL_W, PANEL_H))
+        self.scroll.setHasVerticalScroller_(True)
+        self.scroll.setHasHorizontalScroller_(False)
+        self.scroll.setAutohidesScrollers_(False)
+        self.scroll.setScrollerStyle_(AppKit.NSScrollerStyleLegacy)
+        self.scroll.setDrawsBackground_(True)
+        self.scroll.setBackgroundColor_(PALETTE["bg"])
+        self.scroll.setDocumentView_(view)
+        self.panel.setContentView_(self.scroll)
         self._title_h = self.panel.frame().size.height - PANEL_H   # measured, not assumed
         self._relayout()
         self.rows["status"].setStringValue_("等待识别微信聊天…" if READ_ONLY else "等待微信消息…")
@@ -377,79 +397,84 @@ class HudController(NSObject):
         return self.slot_tones[slot] in styles.PRESETS
 
     @objc.python_method
-    def _relayout(self):
-        """Fit visible content, anchoring the window's top edge.
-
-        Diagnostic mode shows only recognition results. Normal mode keeps tone selectors
-        available, but reserves candidate space only after a reply arrives.
-        """
-        if self._collapsed:
+    def _relayout(self, fit_window=True):
+        """Wrap content to the viewport and scroll overflow within the visible screen."""
+        if self._collapsed or self._layouting:
             return
-        # The brand block is stable; every information row below it is content-driven.
-        # Empty intent/risk fields and unfilled reply slots must not reserve blank space.
-        placements = list(self._fixed[:5])
-        dy = 96
-        limits = {"chat": (18, 36), "status": (16, 40), "message": (24, 90),
-                  "sender": (16, 44), "intent": (26, 52), "confidence": (16, 32),
-                  "risk": (18, 36), "actions": (18, 48), "cand_header": (18, 52)}
-        for key in ("chat", "status", "message", "sender", "intent", "confidence",
-                    "risk", "actions", "cand_header"):
-            ctrl = self.rows[key]
-            visible = bool(ctrl.stringValue().strip())
-            if READ_ONLY and key in ("intent", "confidence", "risk", "actions"):
-                visible = False
-            ctrl.setHidden_(not visible)
-            if not visible:
-                continue
-            if key == "cand_header":
-                dy += 12
-            minimum, maximum = limits[key]
-            measured = ctrl.cell().cellSizeForBounds_(NSMakeRect(0, 0, PANEL_W - 32, maximum)).height
-            height = min(maximum, max(minimum, int(measured) + 2))
-            placements.append((ctrl, 16, dy, PANEL_W - 32, height))
-            dy += height + (10 if key in ("message", "sender") else 6)
+        self._layouting = True
+        try:
+            width = self.scroll.contentSize().width
+            old_y = self.scroll.contentView().bounds().origin.y
+            placements = list(self._fixed[:5])
+            # Keep settings at the right edge and let the brand text use available width.
+            placements[1] = (placements[1][0], 72, 14, width - 150, 22)
+            placements[2] = (placements[2][0], 72, 39, width - 88, 22)
+            placements[3] = (placements[3][0], width - 72, 10, 60, 26)
+            placements[4] = (placements[4][0], 16, 66, width - 32, 18)
+            dy = 96
+            for key in ("chat", "status", "message", "sender", "intent", "confidence",
+                        "risk", "actions", "cand_header"):
+                ctrl = self.rows[key]
+                visible = bool(ctrl.stringValue().strip())
+                if READ_ONLY and key in ("intent", "confidence", "risk", "actions"):
+                    visible = False
+                ctrl.setHidden_(not visible)
+                if not visible:
+                    continue
+                if key == "cand_header":
+                    dy += 12
+                ctrl.cell().setWraps_(True)
+                measured = ctrl.cell().cellSizeForBounds_(NSMakeRect(0, 0, width - 32, 100000)).height
+                height = max(18, int(measured) + 3)
+                placements.append((ctrl, 16, dy, width - 32, height))
+                dy += height + (10 if key in ("message", "sender") else 6)
+            for slot in range(styles.MAX_SLOTS):
+                for ctrl in (self._dds[slot], self._dd_boxes[slot]):
+                    ctrl.setHidden_(READ_ONLY)
+                if not READ_ONLY:
+                    placements += [(self._dd_boxes[slot], 14, dy, width - 28, TONE_DD_H),
+                                   (self._dds[slot], 20, dy, width - 40, TONE_DD_H)]
+                    dy += TONE_DD_H + 12
+                for row in range(styles.PER_TONE):
+                    r = self._rows[slot][row]
+                    visible = not READ_ONLY and self._slot_active(slot) and bool(self.cand_texts[slot * styles.PER_TONE + row])
+                    for ctrl in (r["text"], r["prob"], r["btn"], r["fill_btn"]):
+                        ctrl.setHidden_(not visible)
+                    if not visible:
+                        continue
+                    measured = r["text"].cell().cellSizeForBounds_(NSMakeRect(0, 0, width - 40, 100000)).height
+                    text_h = max(22, int(measured) + 4)
+                    placements.append((r["text"], 20, dy, width - 40, text_h))
+                    action_y = dy + text_h + 6
+                    placements += [(r["prob"], 20, action_y + 5, 90, 18),
+                                   (r["btn"], width - 140, action_y, 56, 24),
+                                   (r["fill_btn"], width - 80, action_y, 60, 24)]
+                    dy = action_y + 38
+                if not READ_ONLY:
+                    dy += GROUP_GAP
+            content_h = dy + BOTTOM_PAD
+            if fit_window and not self._user_sized:
+                screen = (self.panel.screen() or NSScreen.mainScreen()).visibleFrame()
+                f = self.panel.frame()
+                frame_h = max(240, min(content_h + self._title_h, screen.size.height - 16))
+                top = min(f.origin.y + f.size.height, screen.origin.y + screen.size.height)
+                y = max(screen.origin.y, top - frame_h)
+                self.panel.setFrame_display_(NSMakeRect(f.origin.x, y, f.size.width, frame_h), True)
+            self.document.setFrameSize_(NSMakeSize(width, max(content_h, self.scroll.contentSize().height)))
+            for ctrl, x, top, w, h in placements:
+                ctrl.setFrame_(NSMakeRect(x, top, w, h))
+            max_y = max(0, self.document.frame().size.height - self.scroll.contentSize().height)
+            self.scroll.contentView().scrollToPoint_((0, min(old_y, max_y)))
+            self.scroll.reflectScrolledClipView_(self.scroll.contentView())
+            self._expanded_h = self.panel.frame().size.height
+        finally:
+            self._layouting = False
 
-        for slot in range(styles.MAX_SLOTS):
-            for ctrl in (self._dds[slot], self._dd_boxes[slot]):
-                ctrl.setHidden_(READ_ONLY)
-            if not READ_ONLY:
-                placements.append((self._dd_boxes[slot], TONE_DD_X, dy, TONE_DD_W, TONE_DD_H))
-                placements.append((self._dds[slot], TONE_DD_X + TONE_DD_INSET, dy,
-                                   TONE_DD_W - 2 * TONE_DD_INSET, TONE_DD_H))
-                dy += TONE_DD_H + TONE_DD_GAP
-            for row in range(styles.PER_TONE):
-                r = self._rows[slot][row]
-                controls = (r["prob"], r["text"], r["btn"], r["fill_btn"])
-                has_reply = bool(self.cand_texts[slot * styles.PER_TONE + row])
-                visible = not READ_ONLY and self._slot_active(slot) and has_reply
-                for ctrl in controls:
-                    ctrl.setHidden_(not visible)
-                if visible:
-                    placements += [
-                        (r["text"], CAND_TEXT_X, dy, CAND_TEXT_W, CAND_TEXT_H),
-                        (r["prob"], CAND_PROB_X, dy + 34, CAND_PROB_W, 14),
-                        (r["btn"], CAND_BTN_X, dy + 24, CAND_BTN_W, CAND_BTN_H),
-                        (r["fill_btn"], CAND_BTN_X + CAND_BTN_W + CAND_BTN_GAP, dy + 24,
-                         CAND_BTN_W, CAND_BTN_H),
-                    ]
-                    dy += CAND_ROW_H
-            if not READ_ONLY and slot < styles.MAX_SLOTS - 1:
-                dy += GROUP_GAP
-
-        content_h = dy + BOTTOM_PAD
-        view = self.panel.contentView()
-        view.setFrameSize_(NSMakeSize(PANEL_W, content_h))
-        for ctrl, x, top, w, h in placements:
-            ctrl.setFrame_(NSMakeRect(x, content_h - top - h, w, h))
-
-        # resize the window with its TOP edge pinned: growing downwards is what the eye
-        # expects here, and _position_near() anchors the panel to WeChat's top anyway
-        f = self.panel.frame()
-        top = f.origin.y + f.size.height
-        frame_h = content_h + self._title_h
-        self.panel.setFrame_display_(
-            NSMakeRect(f.origin.x, top - frame_h, PANEL_W, frame_h), True)
-        self._expanded_h = frame_h
+    def windowDidResize_(self, notification):
+        if self._layouting or self._collapsed or not hasattr(self, "scroll"):
+            return
+        self._user_sized = True
+        self._relayout(fit_window=False)
 
     @objc.python_method
     def _wire_window_controls(self):
@@ -458,7 +483,7 @@ class HudController(NSObject):
         red    -> quit. A hidden panel would otherwise be unreachable: LSUIElement apps
                   have no Dock icon, so a plain order-out looks like a crash.
         yellow -> roll the panel up instead of miniaturizing, for the same reason.
-        green  -> hidden: the HUD has a fixed size and nothing to zoom.
+        green  -> native zoom; the scroll view keeps overflow reachable.
         """
         close = self.panel.standardWindowButton_(NSWindowCloseButton)
         mini = self.panel.standardWindowButton_(NSWindowMiniaturizeButton)
@@ -472,7 +497,8 @@ class HudController(NSObject):
             mini.setAction_("collapsePanel:")
             mini.setToolTip_("收起 / 展开面板")
         if zoom:
-            zoom.setHidden_(True)
+            zoom.setHidden_(False)
+            zoom.setEnabled_(True)
 
     @objc.python_method
     def _install_status_item(self):
@@ -669,7 +695,7 @@ class HudController(NSObject):
                          if s.frame().origin.x <= cx_win <= s.frame().origin.x + s.frame().size.width
                          and s.frame().origin.y <= cyan <= s.frame().origin.y + s.frame().size.height),
                         primary)
-            sf = host.frame()
+            sf = host.visibleFrame()
             # dock right of WeChat if it fits on that screen, else left, else its right edge
             x = wx + ww + 8
             if x + panel_w > sf.origin.x + sf.size.width:
@@ -677,11 +703,11 @@ class HudController(NSObject):
             if x < sf.origin.x:
                 x = sf.origin.x + sf.size.width - panel_w - 12
             y = flip - wy - panel_h
-            y = max(sf.origin.y + 40, min(y, sf.origin.y + sf.size.height - panel_h - 40))
+            y = max(sf.origin.y, min(y, sf.origin.y + sf.size.height - panel_h))
         else:
-            sf = primary.frame()
+            sf = primary.visibleFrame()
             x = sf.size.width - panel_w - 12
-            y = sf.size.height - panel_h - 60
+            y = sf.origin.y + sf.size.height - panel_h - 8
 
         # dead-band: ignore sub-2pt corrections and one-off blips, so WeChat's own window
         # animations (and our own numeric noise) stop nudging the panel around
@@ -727,7 +753,14 @@ class HudController(NSObject):
         if ok:
             self._render("status", "已填入", PALETTE["green"])
         else:
-            self._render("status", f"填入失败：{reason}", PALETTE["red"])
+            if reason == fill.REASON_NO_INPUT:
+                pb = NSPasteboard.generalPasteboard()
+                pb.clearContents()
+                pb.setString_forType_(text, NSPasteboardTypeString)
+                self._render("status", "微信未开放输入框，已复制这条回复。点微信输入框后按 ⌘V 粘贴。", PALETTE["amber"])
+            else:
+                self._render("status", f"填入失败：{reason}", PALETTE["red"])
+        self._relayout()
 
     def toneChanged_(self, sender):
         """A 话术 dropdown moved: the verdict is still valid, only the writing changes."""
@@ -735,8 +768,7 @@ class HudController(NSObject):
         if picked == self.slot_tones:
             return
         self.slot_tones = picked
-        # the panel is sized by how many slots are in use, so re-lay-out *before* the new
-        # candidates arrive: the empty rows appear at once and nothing jumps later
+        # Remove stale candidates immediately; fresh results expand the scroll document.
         self._clear_candidates()
         self._regenerate()
 
@@ -856,34 +888,23 @@ class HudController(NSObject):
 
     @objc.python_method
     def _set_collapsed(self, collapsed: bool):
-        """Roll the panel up to a title+status strip, or back to full height."""
         self._collapsed = collapsed
-        controlled = ["message", "sender", "intent", "confidence", "risk", "actions",
-                      "cand_header"]   # "chat" and "status" survive collapsing
-        for key in controlled:
-            self.rows[key].setHidden_(collapsed)
-        for slot in range(styles.MAX_SLOTS):
-            self._dds[slot].setHidden_(collapsed)
-            self._dd_boxes[slot].setHidden_(collapsed)
-            for row in range(styles.PER_TONE):
-                has = self.cand_texts[slot * styles.PER_TONE + row] is not None
-                for c in self._row_controls(slot, row):
-                    c.setHidden_(collapsed or not has)
+        self._layouting = True
+        try:
+            rect = self.panel.frame()
+            if collapsed:
+                self._expanded_h = rect.size.height
+            height = COLLAPSED_H if collapsed else self._expanded_h
+            self.panel.setContentMinSize_(NSMakeSize(360, 68 if collapsed else 210))
+            self.panel.setFrame_display_(NSMakeRect(rect.origin.x, rect.origin.y + rect.size.height - height,
+                                                  rect.size.width, height), True)
+            self.scroll.setHasVerticalScroller_(not collapsed)
+            self.scroll.contentView().scrollToPoint_((0, 0))
+        finally:
+            self._layouting = False
         if not collapsed:
-            # re-expanding puts every control back where _relayout() wants it, and re-hides
-            # the slots that are switched off — the collapse above cannot know that
-            self._relayout()
-            self._last_origin = None      # let the next tick re-dock cleanly
-            return
-
-        rect = self.panel.frame()
-        # _expanded_h is maintained by _relayout() (it changes with the tone selection), so
-        # expanding reads the current full height rather than a value captured at startup
-        new_h = COLLAPSED_H if collapsed else (self._expanded_h or PANEL_H)
-        self.panel.setFrame_display_(
-            NSMakeRect(rect.origin.x, rect.origin.y + (rect.size.height - new_h),
-                       rect.size.width, new_h), True)
-        self._last_origin = None      # let the next tick re-dock cleanly
+            self._relayout(fit_window=False)
+        self._last_origin = None
 
     # --------------------------------------------------------------- loop
     def tick_(self, timer):
