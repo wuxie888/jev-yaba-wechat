@@ -287,7 +287,7 @@ class HudController(NSObject):
         ):
             tf = self._make_label(14, 0, PANEL_W - 28, height,
                                   size=size, color=color, bold=bold)
-            if key == "message":
+            if key in ("message", "sender", "status", "actions", "chat"):
                 tf.cell().setWraps_(True)
             view.addSubview_(tf)
             self.rows[key] = tf
@@ -298,7 +298,8 @@ class HudController(NSObject):
         dy += 6
         header = self._make_label(14, 0, PANEL_W - 28, 16,
                                   size=11, color=PALETTE["muted"])
-        header.setStringValue_("候选回复（按合适度排序）")
+        header.setStringValue_("回复生成已暂停。这里仅核对聊天文字。" if READ_ONLY else "选择话术，收到回复后在这里挑选")
+        header.cell().setWraps_(True)
         view.addSubview_(header)
         self.rows["cand_header"] = header
         self._fixed.append((header, 14, dy, PANEL_W - 28, 16))
@@ -355,7 +356,8 @@ class HudController(NSObject):
         self.panel.setContentView_(view)
         self._title_h = self.panel.frame().size.height - PANEL_H   # measured, not assumed
         self._relayout()
-        self.rows["status"].setStringValue_("等待微信消息…")
+        self.rows["status"].setStringValue_("等待识别微信聊天…" if READ_ONLY else "等待微信消息…")
+        self._relayout()
         self._wire_window_controls()
         self._install_status_item()
 
@@ -365,28 +367,53 @@ class HudController(NSObject):
 
     @objc.python_method
     def _relayout(self):
-        """Place every control for the current tone selection and size the panel to fit.
+        """Fit visible content, anchoring the window's top edge.
 
-        Two things are computed here rather than at build time. Positions are measured from
-        the TOP, so when the panel grows or shrinks nothing above the change moves — only the
-        bottom edge does. And the height follows the groups in use: a slot on 不用 reserves
-        neither a dropdown's worth of rows nor its candidates, which is what removes the dead
-        space a fixed-height panel left in the middle.
+        Diagnostic mode shows only recognition results. Normal mode keeps tone selectors
+        available, but reserves candidate space only after a reply arrives.
         """
-        dy = self._group_top
-        placements = []          # (control, x, dy_from_top, w, h)
+        if self._collapsed:
+            return
+        # The brand block is stable; every information row below it is content-driven.
+        # Empty intent/risk fields and unfilled reply slots must not reserve blank space.
+        placements = list(self._fixed[:3])
+        dy = 78
+        limits = {"chat": (18, 36), "status": (16, 40), "message": (24, 90),
+                  "sender": (16, 44), "intent": (26, 52), "confidence": (16, 32),
+                  "risk": (18, 36), "actions": (18, 48), "cand_header": (18, 52)}
+        for key in ("chat", "status", "message", "sender", "intent", "confidence",
+                    "risk", "actions", "cand_header"):
+            ctrl = self.rows[key]
+            visible = bool(ctrl.stringValue().strip())
+            if READ_ONLY and key in ("intent", "confidence", "risk", "actions"):
+                visible = False
+            ctrl.setHidden_(not visible)
+            if not visible:
+                continue
+            if key == "cand_header":
+                dy += 12
+            minimum, maximum = limits[key]
+            measured = ctrl.cell().cellSizeForBounds_(NSMakeRect(0, 0, PANEL_W - 32, maximum)).height
+            height = min(maximum, max(minimum, int(measured) + 2))
+            placements.append((ctrl, 16, dy, PANEL_W - 32, height))
+            dy += height + (10 if key in ("message", "sender") else 6)
+
         for slot in range(styles.MAX_SLOTS):
-            placements.append((self._dd_boxes[slot], TONE_DD_X, dy, TONE_DD_W, TONE_DD_H))
-            placements.append((self._dds[slot], TONE_DD_X + TONE_DD_INSET, dy,
-                               TONE_DD_W - 2 * TONE_DD_INSET, TONE_DD_H))
-            dy += TONE_DD_H + TONE_DD_GAP
-            active = self._slot_active(slot)
+            for ctrl in (self._dds[slot], self._dd_boxes[slot]):
+                ctrl.setHidden_(READ_ONLY)
+            if not READ_ONLY:
+                placements.append((self._dd_boxes[slot], TONE_DD_X, dy, TONE_DD_W, TONE_DD_H))
+                placements.append((self._dds[slot], TONE_DD_X + TONE_DD_INSET, dy,
+                                   TONE_DD_W - 2 * TONE_DD_INSET, TONE_DD_H))
+                dy += TONE_DD_H + TONE_DD_GAP
             for row in range(styles.PER_TONE):
                 r = self._rows[slot][row]
                 controls = (r["prob"], r["text"], r["btn"], r["fill_btn"])
-                if active:
-                    # row height is reserved whether or not the candidates have arrived, so
-                    # nothing jumps when results land mid-generation
+                has_reply = bool(self.cand_texts[slot * styles.PER_TONE + row])
+                visible = not READ_ONLY and self._slot_active(slot) and has_reply
+                for ctrl in controls:
+                    ctrl.setHidden_(not visible)
+                if visible:
                     placements += [
                         (r["text"], CAND_TEXT_X, dy, CAND_TEXT_W, CAND_TEXT_H),
                         (r["prob"], CAND_PROB_X, dy + 34, CAND_PROB_W, 14),
@@ -395,16 +422,13 @@ class HudController(NSObject):
                          CAND_BTN_W, CAND_BTN_H),
                     ]
                     dy += CAND_ROW_H
-                else:
-                    for c in controls:
-                        c.setHidden_(True)
-            if slot < styles.MAX_SLOTS - 1:
+            if not READ_ONLY and slot < styles.MAX_SLOTS - 1:
                 dy += GROUP_GAP
 
         content_h = dy + BOTTOM_PAD
         view = self.panel.contentView()
         view.setFrameSize_(NSMakeSize(PANEL_W, content_h))
-        for ctrl, x, top, w, h in placements + self._fixed:
+        for ctrl, x, top, w, h in placements:
             ctrl.setFrame_(NSMakeRect(x, content_h - top - h, w, h))
 
         # resize the window with its TOP edge pinned: growing downwards is what the eye
@@ -517,9 +541,7 @@ class HudController(NSObject):
     def _render_groups(self, payload: list):
         """payload: [(slot, tone, [{"text","prob"}, ...]), ...] — one entry per active tone.
 
-        Rows the model did not fill are emptied and their buttons hidden, but the row keeps
-        its space: the panel's height is decided by the tone selection, not by how many lines
-        came back, so a late result cannot resize the panel under the cursor.
+        Unfilled rows are hidden and take no space; new results expand the panel downward.
         """
         wanted = set()
         for slot, _tone, items in payload:
@@ -554,6 +576,7 @@ class HudController(NSObject):
                 r["btn"].setHidden_(True)
                 r["fill_btn"].setHidden_(True)
                 self.cand_texts[slot * styles.PER_TONE + row] = None
+        self._relayout()
 
     @objc.python_method
     def _display_height(self) -> float:
@@ -685,6 +708,7 @@ class HudController(NSObject):
             return
         self._render("status", f"换话术中…（{'、'.join(active)}）", PALETTE["muted"])
         self.rows["cand_header"].setStringValue_("候选回复 · 生成中…")
+        self._relayout()
         threading.Thread(target=self._regen_work,
                          args=(text, self._last_intent, list(self.slot_tones)),
                          daemon=True).start()
@@ -1126,15 +1150,17 @@ class HudController(NSObject):
     # --- main-thread callbacks (AppKit is not thread safe)
     def applyChat_(self, title):
         self._chat_title = title
-        self._render("chat", title, PALETTE["green"])
+        self._render("chat", title or ("当前微信聊天" if READ_ONLY else ""), PALETTE["green"])
+        self._relayout()
 
     def applyReadOnly_(self, payload):
         text, sender, prev = payload
         self._show()
-        self._render("status", "读屏诊断模式 · 模型调用已暂停", PALETTE["amber"])
+        self._render("status", "聊天识别预览", PALETTE["muted"])
         self._render("message", text, PALETTE["text"])
         self._render("sender", self._context_line(sender, prev), PALETTE["muted"])
-        self.rows["cand_header"].setStringValue_("仅核对识别结果，不生成回复")
+        self.rows["cand_header"].setStringValue_("回复生成已暂停。这里仅核对聊天文字。")
+        self._relayout()
 
     def applyIncoming_(self, payload):
         # a new message landed but we are not analysing yet (burst in progress):
@@ -1144,6 +1170,7 @@ class HudController(NSObject):
         self._render("status", "有新消息 · 等消息停稳…", PALETTE["muted"])
         self._render("message", text, PALETTE["muted"])   # grey: not analysed yet
         self._render("sender", self._context_line(sender, prev), PALETTE["muted"])
+        self._relayout()
 
     def applyPending_(self, payload):
         text, sender, prev = payload
@@ -1153,6 +1180,7 @@ class HudController(NSObject):
         self._render("sender", self._context_line(sender, prev), PALETTE["muted"])
         self._clear_candidates()
         self.rows["cand_header"].setStringValue_("候选回复 · 等待判断…")
+        self._relayout()
 
     def applyJudgment_(self, payload):
         v, sender, prev = payload
@@ -1187,6 +1215,7 @@ class HudController(NSObject):
         self._render("risk", f"● {label}  {risk}/9", color)
         self._render("actions", " · ".join(v.get("actions", [])), PALETTE["text"])
         self.rows["cand_header"].setStringValue_("候选回复 · 生成中…")
+        self._relayout()
 
     def applyCandidates_(self, payload):
         self.rows["cand_header"].setStringValue_("候选回复（按合适度排序）")
@@ -1195,6 +1224,7 @@ class HudController(NSObject):
     def applyError_(self, text):
         self._show()                       # never vanish without telling the user why
         self._render("status", text, PALETTE["red"])
+        self._relayout()
 
     def applyHidden_(self, reason):
         # WeChat gone or unreadable -> take the panel away (the app "opens with WeChat")
@@ -1288,6 +1318,7 @@ def main() -> None:
         controller._render("intent", "等你开口", PALETTE["text"])
         controller._render("actions", "选好回复后，由你发送。", PALETTE["muted"])
         controller.rows["cand_header"].setStringValue_("回复候选将在连接后出现")
+        controller._relayout()
         controller.panel.center()
         controller._show()
         app.activateIgnoringOtherApps_(True)
