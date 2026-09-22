@@ -21,6 +21,17 @@ class ChatGeometry(unittest.TestCase):
                 self.assertEqual(messages[0].sender, '测试同事')
                 self.assertEqual([(b.y, b.h) for b in blocks], positions)
 
+    def test_four_lines_fold_against_previous_line_and_keep_full_bounds(self):
+        blocks = [TextBlock(text, 1, x, .7 - i * .024, w, .015)
+                  for i, (text, x, w) in enumerate([('第一行消息', .37, .22),
+                       ('第二行消息', .35, .12), ('第三行消息', .35, .1), ('第四行消息', .35, .1)])]
+        messages = extract_messages(blocks, window_height=1000)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(len(messages[0].lines), 4)
+        self.assertAlmostEqual(messages[0].x, .35)
+        self.assertAlmostEqual(messages[0].w, .24)
+        self.assertAlmostEqual(messages[0].h, .087)
+
     def test_single_chat_short_message_is_not_discarded_as_nickname(self):
         blocks = [TextBlock('好', 1, .36, .5, .02, 15 / 585)]
         self.assertEqual(extract_messages(blocks, window_height=585)[0].text, '好')

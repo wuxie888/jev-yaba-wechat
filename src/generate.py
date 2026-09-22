@@ -21,11 +21,15 @@ leaves the machine — swap in a local model if that matters more than reply qua
 from __future__ import annotations
 
 import concurrent.futures
+import http.client
+import io
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from pathlib import Path
@@ -41,6 +45,79 @@ DEFAULT_OPENAI_BASE = "https://api.openai.com/v1"
 DEFAULT_ANTHROPIC_BASE = "https://api.anthropic.com"
 MISSING_HINT = ("未配置生成层 Key：候选回复需要它，判断/风险不需要。"
                 "设置 OPENAI_API_KEY（或 ANTHROPIC_API_KEY）后重启，见 README 配置章节。")
+
+
+class _KeepAlivePool:
+    """std 库 keep-alive 连接池：按 (scheme, host, port) 复用 http.client 连接。
+
+    urllib.urlopen 每次请求都新建 DNS+TCP+TLS（一条连接 ~0.1–0.3 s 白付掉），而
+    生成层每条消息至少发一次、两个话术并发发两次，换话术再发两次。这里空闲连接
+    表有锁；一条连接同一时刻只属于一个请求，所以并发调用天然各拿各的连接。
+
+    从池里取出的连接可能是服务端已悄悄关掉的（keep-alive 超时），因此网络类异常
+    换新连接重试一次——与 urllib3 的做法一致。HTTP >= 300 不重试，按调用方依赖的
+    urllib.error.HTTPError 形状抛出（e.read() 仍能拿到错误正文）。不跟随重定向：
+    LLM 端点不会 30x，真遇到就以 HTTPError 形式可见，而不是静默 GET 掉。
+    """
+
+    def __init__(self, max_idle: int = 4):
+        self._lock = threading.Lock()
+        self._idle: dict[tuple, list] = {}
+        self._max_idle = max_idle
+
+    def _checkout(self, scheme, host, port, timeout):
+        key = (scheme, host, port)
+        with self._lock:
+            idle = self._idle.get(key)
+            if idle:
+                return key, idle.pop()
+        cls = (http.client.HTTPSConnection if scheme == "https"
+               else http.client.HTTPConnection)
+        return key, cls(host, port, timeout=timeout)
+
+    def _checkin(self, key, conn):
+        with self._lock:
+            idle = self._idle.setdefault(key, [])
+            if len(idle) < self._max_idle:
+                idle.append(conn)
+                return
+        conn.close()
+
+    def post_json(self, url: str, headers: dict, body: dict, timeout: float) -> dict:
+        p = urllib.parse.urlparse(url)
+        scheme = p.scheme or "https"
+        port = p.port or (443 if scheme == "https" else 80)
+        path = p.path + (("?" + p.query) if p.query else "")
+        payload = json.dumps(body).encode()
+        last_exc: Exception | None = None
+        for _attempt in range(2):
+            key, conn = self._checkout(scheme, p.hostname, port, timeout)
+            try:
+                conn.request("POST", path, body=payload, headers=headers)
+                resp = conn.getresponse()
+                data = resp.read()
+            except (http.client.HTTPException, OSError) as e:
+                conn.close()
+                last_exc = e
+                continue
+            if resp.will_close:
+                conn.close()
+            else:
+                self._checkin(key, conn)
+            if resp.status >= 300:
+                raise urllib.error.HTTPError(
+                    url, resp.status, resp.reason, resp.headers, io.BytesIO(data))
+            return json.loads(data)
+        assert last_exc is not None
+        raise last_exc
+
+
+_POOL = _KeepAlivePool()
+
+
+def http_post_json(url: str, headers: dict, body: dict, timeout: float) -> dict:
+    """模块级 POST 入口：generate 与 judge_jev 共用同一个连接池。"""
+    return _POOL.post_json(url, headers, body, timeout)
 
 
 class ThinkingOnlyError(ValueError):
@@ -199,7 +276,17 @@ class Generator:
             self._creds = (base, key, self.model_override or model)
         return self._creds
 
-    def _call(self, prompt: str) -> str:
+    def _call(self, prompt: str, on_delta=None) -> str:
+        """One completion. With `on_delta`, streams: each content fragment is passed to it
+        as it arrives, and the full text is still returned at the end (so the caller can
+        parse lines once, authoritatively, from the same string).
+
+        Streaming is OpenAI-shape only (`stream: true` + SSE) — that is what the DeepSeek /
+        SiliconFlow / vLLM tier speaks and where the latency win is. The Anthropic shape
+        keeps its one-shot request: `on_delta` is silently ignored there. If a gateway
+        accepts `stream: true` but answers with plain JSON anyway, the response is parsed
+        the old way — streaming degrades, it does not fail.
+        """
         base, key, model, _src, api = self.credentials_override or load_credentials()
         # the constructor's overrides win — without this the `model` argument was accepted
         # and silently ignored, so the request went out with whatever the config named
@@ -248,7 +335,14 @@ class Generator:
         body = {"model": model, "max_tokens": 300, "temperature": 0.9,
                 "messages": [{"role": "user", "content": prompt}]}
         headers = {"content-type": "application/json", "authorization": f"Bearer {key}"}
+        if on_delta is not None:
+            return self._stream_openai(url, headers, body, model, on_delta)
         data = self._post(url, headers, body)
+        return self._openai_json(data, model)
+
+    @staticmethod
+    def _openai_json(data: dict, model: str) -> str:
+        """Parse a one-shot OpenAI-shape response; raises on the thinking-only case."""
         choices = data.get("choices") or []
         if not choices:
             return ""
@@ -263,11 +357,56 @@ class Generator:
                     raise ThinkingOnlyError(THINKING_ONLY_HINT.format(model=model))
         return content
 
+    def _stream_openai(self, url: str, headers: dict, body: dict,
+                       model: str, on_delta) -> str:
+        """SSE variant of the OpenAI-shape call; returns the full content text.
+
+        The wire format is `data: {json}` lines ended by `data: [DONE]`, each carrying a
+        `delta` with the next fragment. Reasoning models send their thinking through the
+        same deltas (reasoning_content / reasoning) before any content, so a stream that
+        ends with thinking and no text is the same wrong-model case as the one-shot path
+        and raises the same error — nothing was shown yet, because nothing was emitted.
+        """
+        self._last_url = url
+        req = urllib.request.Request(
+            url, data=json.dumps({**body, "stream": True}).encode(), headers=headers)
+        content: list[str] = []
+        reasoning: list[str] = []
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            ctype = (r.headers.get("content-type") or "").lower()
+            if "event-stream" not in ctype:
+                # the gateway took `stream: true` but answered with one JSON document:
+                # parse it the ordinary way instead of failing
+                return self._openai_json(json.load(r), model)
+            for raw_line in r:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue        # blank separators, "event:" lines, ": keep-alive"
+                payload = line[len("data:"):].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    evt = json.loads(payload)
+                except ValueError:
+                    continue        # a malformed keepalive must not kill the stream
+                for ch in evt.get("choices") or []:
+                    delta = ch.get("delta") or {}
+                    frag = delta.get("content") or ""
+                    if frag:
+                        content.append(frag)
+                        on_delta(frag)
+                    for field in ("reasoning_content", "reasoning"):
+                        v = delta.get(field)
+                        if isinstance(v, str) and v:
+                            reasoning.append(v)
+        raw = "".join(content)
+        if not raw.strip() and "".join(reasoning).strip():
+            raise ThinkingOnlyError(THINKING_ONLY_HINT.format(model=model))
+        return raw
+
     def _post(self, url: str, headers: dict, body: dict) -> dict:
         self._last_url = url
-        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            return json.load(r)
+        return http_post_json(url, headers, body, self.timeout)
 
     @staticmethod
     def _parse(raw: str) -> list[str]:
@@ -285,8 +424,14 @@ class Generator:
         return out
 
     def _one_tone(self, message: str, intent: str, tone: str,
-                  context: str | None = None) -> tuple[list[str], str]:
-        """One request for one tone. Returns (texts, error); never raises."""
+                  context: str | None = None,
+                  on_line=None) -> tuple[list[str], str]:
+        """One request for one tone. Returns (texts, error); never raises.
+
+        With `on_line`, each finished line is handed over the moment it completes so the
+        panel can show it before the request ends — the final `texts` stay the one
+        authoritative parse of the whole reply, and the callback is only the early look.
+        """
         # The recent turns go in with their speakers ("王总: …"), because a reply that fits
         # the last two sentences is usually not a reply to this one sentence in isolation.
         context_line = f"最近的对话：\n{context}\n\n" if context else ""
@@ -295,8 +440,21 @@ class Generator:
                                    intent_line=intent_line,
                                    n=styles.PER_TONE, tone=tone,
                                    instruction=styles.PRESETS[tone])
+        emitted = 0
+        buf = ""                 # fragments since the last newline
+
+        def on_delta(frag: str) -> None:
+            nonlocal buf, emitted
+            buf += frag
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                for text in self._parse(line):
+                    if emitted < styles.PER_TONE:
+                        emitted += 1
+                        on_line(text)
+
         try:
-            raw = self._call(prompt)
+            raw = self._call(prompt, on_delta if on_line is not None else None)
         except ThinkingOnlyError as e:
             return [], str(e)            # already panel-ready: model named, fix suggested
         except urllib.error.HTTPError as e:
@@ -304,11 +462,22 @@ class Generator:
             return [], f"HTTP {e.code} @ {self._last_url} — {detail}"
         except Exception as e:
             return [], f"{type(e).__name__}: {e}"
+        if on_line is not None:
+            # Sync the callback with the authoritative parse. Two ways lines can be
+            # missing from what the stream emitted: the model often stops without a
+            # trailing newline (the last line sits in `buf`), and a gateway that fell
+            # back to one-shot JSON streams nothing at all. Either way the remaining
+            # lines go out here, so the panel shows them at this request's end rather
+            # than waiting for ranking.
+            for text in self._parse(raw)[emitted:styles.PER_TONE]:
+                emitted += 1
+                on_line(text)
         return self._parse(raw)[:styles.PER_TONE], ""
 
     def generate(self, message: str, intent: str = "",
                  slot_tones: list[str] | None = None,
-                 context: str | None = None) -> dict:
+                 context: str | None = None,
+                 on_candidate=None) -> dict:
         """One concurrent request per selected 话术; returns the candidates grouped by tone.
 
         A tone gets its own request rather than one request listing every tone: asking a
@@ -318,6 +487,10 @@ class Generator:
 
         `slot_tones` is the panel's per-slot selection (styles.NONE_LABEL marks an unused
         slot). Two slots holding the same tone is allowed and simply runs it twice.
+
+        `on_candidate(slot, tone, text)` fires from the worker threads the moment a line
+        completes — streaming's early look, before the full result is in. Callers that do
+        not pass it get exactly the old collect-then-return behaviour.
         """
         slots = list(slot_tones or (styles.DEFAULT_SLOTS + [styles.NONE_LABEL]))
         active = [(i, t) for i, t in enumerate(slots) if t in styles.PRESETS]
@@ -328,9 +501,16 @@ class Generator:
 
         t0 = time.perf_counter()
         groups: list[dict] = []
+
+        def run(i: int, tone: str):
+            # slot index rides along so the panel knows where the line belongs
+            def on_line(text: str) -> None:
+                on_candidate(i, tone, text)
+            return self._one_tone(message, intent, tone, context,
+                                  on_line if on_candidate is not None else None)
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(active)) as ex:
-            futures = {i: ex.submit(self._one_tone, message, intent, tone, context)
-                       for i, tone in active}
+            futures = {i: ex.submit(run, i, tone) for i, tone in active}
             for i, tone in active:          # read in slot order, not completion order
                 try:
                     texts, err = futures[i].result()

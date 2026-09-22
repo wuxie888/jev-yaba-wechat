@@ -2,7 +2,9 @@
 
 本项目「jev-哑巴微信」基于 jev-jarvis/jev-jarvis 改造。
 
-- 上游：https://github.com/jev-jarvis/jev-jarvis
+- 初始上游：https://github.com/jev-jarvis/jev-jarvis
+- 当前 Mac 上游：https://github.com/jev-chat/jev-chat-jarvis-mac
+- 本次同步：4ae7a2f6e935475a02489c7bacbbebd3b7042790（2026-09-22 核对）
 - 起始提交：f31bd7112624272644fd6889e2010b763d8e7ead
 - 最近合并提交：bacd86b555a81cca329434b3d215f4a253424e56（2026-09-22，含 v0.2.0 后续更新）
 - 原作者版权：Copyright (c) 2026 eatmoreduck

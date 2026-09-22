@@ -274,3 +274,41 @@ if __name__ == "__main__":
             print(f"输入框: {'已找到（可以填入）' if _box is not None else '没找到'}")
     if len(sys.argv) > 1:
         print(f"填入结果: {fill_text(sys.argv[1])}")
+
+
+def input_diagnostic() -> str:
+    """Report permission, version and AX structure only; never read or log chat text."""
+    from collections import Counter, deque
+    app = _wechat_app()
+    if app is None:
+        return REASON_NO_WECHAT
+    bundle = AppKit.NSBundle.bundleWithURL_(app.bundleURL())
+    info = bundle.infoDictionary() if bundle else {}
+    version = str(info.get('CFBundleShortVersionString', '?'))
+    build = str(info.get('CFBundleVersion', '?'))
+    if not has_accessibility():
+        return f'微信 {version}（{build}） · 未授予本应用辅助功能权限。'
+    root = ApplicationServices.AXUIElementCreateApplication(app.processIdentifier())
+    windows = _ax_attr(root, ApplicationServices.kAXWindowsAttribute) or []
+    queue, roles, errors, visited = deque(windows), Counter(), Counter(), 0
+    while queue and visited < MAX_NODES:
+        element = queue.popleft()
+        visited += 1
+        roles[str(_ax_attr(element, ApplicationServices.kAXRoleAttribute) or 'unknown')] += 1
+        try:
+            err, children = ApplicationServices.AXUIElementCopyAttributeValue(
+                element, ApplicationServices.kAXChildrenAttribute, None)
+            if err:
+                errors[int(err)] += 1
+            else:
+                queue.extend(children or [])
+        except Exception:
+            errors['exception'] += 1
+    fields = roles['AXTextArea'] + roles['AXTextField']
+    found = _find_input_box(app.processIdentifier()) is not None
+    detail = '；'.join(f'{role} × {count}' for role, count in sorted(roles.items()))
+    return (f'微信 {version}（{build}） · 辅助功能已授权\n'
+            f'窗口 {len(windows)} 个，读取控件 {visited} 个，文本输入控件 {fields} 个。\n'
+            f'{detail}\n'
+            + ('原版定位逻辑已找到输入框。' if found else '原版定位逻辑未找到输入框。')
+            + (f'\n子节点读取错误：{dict(errors)}' if errors else ''))

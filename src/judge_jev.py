@@ -26,9 +26,9 @@ import json
 import os
 import time
 import urllib.error
-import urllib.request
 
 import userconfig
+from generate import http_post_json
 from judge import ACTION_MAP, INTENTS, RISK_LEVELS
 
 DEFAULT_BASE = "https://api.typesafe.ai"
@@ -125,12 +125,13 @@ class JevJudge:
     def _post(self, payload: dict) -> dict:
         url = f"{self.base}/v1/systemone"
         self._last_url = url
-        req = urllib.request.Request(
-            url, data=json.dumps(payload, ensure_ascii=False).encode(),
-            headers={"content-type": "application/json",
-                     "authorization": f"Bearer {self.key}"})
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            return json.load(r)
+        # 与生成层共用 keep-alive 池（src/generate.py）：判断+排序各一次网络调用，
+        # 每次省掉一条 TLS 握手
+        return http_post_json(
+            url,
+            {"content-type": "application/json",
+             "authorization": f"Bearer {self.key}"},
+            payload, self.timeout)
 
     def warm(self) -> None:
         """Nothing to load — kept so the two backends share a surface."""

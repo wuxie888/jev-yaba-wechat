@@ -52,6 +52,32 @@ class ScrollablePanel(unittest.TestCase):
         c._set_collapsed(False)
         self.assertEqual(c.scroll.frame().size.height, 400)
 
+    def test_old_stream_epoch_and_changed_tone_do_not_overwrite_candidates(self):
+        c = self.controller
+        c.slot_tones = [next(iter(hud.styles.PRESETS))] * 3
+        c._gen_epoch = 10
+        c.applyStreamLine_((9, 0, '旧结果'))
+        self.assertNotIn('旧结果', c.cand_texts)
+        c.applyCandidates_([(0, '已经切换掉的话术', [{'text':'旧候选', 'prob':.8}])])
+        self.assertNotIn('旧候选', c.cand_texts)
+        c.applyStreamLine_((10, 0, '新回复' * 100))
+        self.assertEqual(c.cand_texts[0], '新回复' * 100)
+        self.assertGreater(c._rows[0][0]['text'].frame().size.height, 30)
+
+    def test_late_rank_result_cannot_repaint_new_chat_or_paused_diagnostic(self):
+        c = self.controller
+        c.slot_tones = [next(iter(hud.styles.PRESETS))] * 3
+        payload = [(0, c.slot_tones[0], [{'text':'旧会话回复', 'prob':.8}])]
+        c._view_revision = 4
+        c.applyModelResult_((3, 'applyCandidates:', payload))
+        self.assertNotIn('旧会话回复', c.cand_texts)
+        c._paused = True
+        c.applyModelResult_((4, 'applyCandidates:', payload))
+        self.assertNotIn('旧会话回复', c.cand_texts)
+        c._paused = False
+        c.applyModelResult_((4, 'applyCandidates:', payload))
+        self.assertIn('旧会话回复', c.cand_texts)
+
     def test_missing_input_copies_candidate_and_never_claims_inserted(self):
         c = self.controller
         c.cand_texts[0] = '这是合成测试文字'

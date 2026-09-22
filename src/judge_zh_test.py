@@ -12,16 +12,10 @@ from pathlib import Path
 
 import numpy as np
 
-INTENTS = {
-    "派活": "对方要我做一件事或接一个任务",
-    "催进度": "对方在催促我尽快完成某个已在办的事",
-    "问进度": "对方在询问某件事的进展或状态",
-    "批评": "对方对我的工作或结果表达不满、指出错误",
-    "要解释": "对方要求我说明原因或给出解释",
-    "闲聊": "对方只是在聊天、分享或表达感受，没有具体要求",
-    "约会议": "对方想安排一次会议或通话",
-    "夸奖": "对方在肯定、称赞我的成果",
-}
+# 直接 import 判断层的 INTENTS：回归测的必须是线上真正发出的那份 prompt。
+# 此前这里是一份手工同步的副本，judge.py 改了描述这里不会跟着变，回归就在
+# 测一个没人用的配置（与 dtype 那条注释是同一个原则）。
+from judge import INTENTS
 
 # (message text, gold intent) — includes the live-captured ones
 CASES: list[tuple[str, str]] = [

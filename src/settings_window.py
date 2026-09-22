@@ -60,6 +60,7 @@ class ModelSettingsWindow(NSObject):
         self.status['TYPESAFE'] = self._label('', 142, 515, 394, 42, 11)
         self._label('测试仅发送固定测试句，不含微信聊天；可能产生少量 API 费用。\nKey 保存在这台 Mac 上。修改后保存并重启即可生效。',
                     24, 560, 512, 38, 11)
+        self.diagnostic = self._button('检查微信输入框', 24, 602, 170, 'diagnoseInput:')
         self.cancel = self._button('取消', 288, 602, 80, 'cancel:')
         self.save_button = self._button('保存并重启', 384, 602, 152, 'saveSettings:')
         self._reload()
@@ -176,6 +177,10 @@ class ModelSettingsWindow(NSObject):
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 'testFinished:', (prefix, signature, message, success), False)
         threading.Thread(target=work, daemon=True).start()
+
+    def diagnoseInput_(self, sender):
+        self.window.close()
+        self.owner.diagnoseInput_(sender)
 
     def testGPT_(self, sender):
         self._test('OPENAI')
