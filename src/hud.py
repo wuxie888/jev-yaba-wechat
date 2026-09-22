@@ -1539,6 +1539,9 @@ class HudController(NSObject):
 
     # --- main-thread callbacks (AppKit is not thread safe)
     def applyChat_(self, title):
+        if title != self._chat_title:
+            self._clear_candidates()
+            self._stream_rows = {}
         self._chat_title = title
         self._render("chat", title or ("当前微信聊天" if READ_ONLY else ""), PALETTE["green"])
         self._relayout()
@@ -1556,6 +1559,9 @@ class HudController(NSObject):
         # a new message landed but we are not analysing yet (burst in progress):
         # keep the previous verdict visible, just badge it
         text, sender, prev = payload
+        self._clear_candidates()
+        self._stream_rows = {}
+        self.rows["cand_header"].setStringValue_("候选回复 · 等消息停稳…")
         self._show()
         self._render("status", "有新消息 · 等消息停稳…", PALETTE["muted"])
         self._render("message", text, PALETTE["muted"])   # grey: not analysed yet

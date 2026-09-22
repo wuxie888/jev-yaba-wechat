@@ -78,6 +78,15 @@ class ScrollablePanel(unittest.TestCase):
         c.applyModelResult_((4, 'applyCandidates:', payload))
         self.assertIn('旧会话回复', c.cand_texts)
 
+    def test_incoming_message_clears_old_sendable_replies(self):
+        self.populate()
+        c = self.controller
+        self.assertTrue(any(c.cand_texts))
+        with patch.object(hud.HudController, '_show'):
+            c.applyIncoming_(('新的消息', '测试昵称', ''))
+        self.assertFalse(any(c.cand_texts))
+        self.assertTrue(c._rows[0][0]['fill_btn'].isHidden())
+
     def test_missing_input_copies_candidate_and_never_claims_inserted(self):
         c = self.controller
         c.cand_texts[0] = '这是合成测试文字'
