@@ -66,6 +66,7 @@ import styles  # noqa: E402
 import fill  # noqa: E402
 
 BRAND_PREVIEW = "--brand-preview" in sys.argv
+READ_ONLY = userconfig.get("JEV_READ_ONLY") == "1"
 
 PANEL_W, PANEL_H = 360, 614   # tall enough for 3-line candidates + the chat name row
 COLLAPSED_H = 96              # height when the panel is rolled up
@@ -177,7 +178,8 @@ class HudController(NSObject):
         self._judged_once = False      # first judge call includes the local model load
         self._read_once = False        # first OCR call includes Vision's own load
         self._last_skip_reason = None
-        self.judge = None if BRAND_PREVIEW else make_judge()
+        self._empty_read_diagnostic = None
+        self.judge = None if BRAND_PREVIEW or READ_ONLY else make_judge()
         self.generator = Generator()
         # 话术: per-slot tone selection. A slot on 不用 contributes no request and no rows,
         # so the panel is exactly as tall as the groups actually in use.
@@ -218,7 +220,7 @@ class HudController(NSObject):
         self._pending_origin = None   # candidate origin awaiting confirmation
         self._build_panel()
         self._expanded_h = self.panel.frame().size.height
-        if not BRAND_PREVIEW:
+        if not BRAND_PREVIEW and not READ_ONLY:
             threading.Thread(target=self._prejudge_loop, daemon=True).start()
         return self
 
@@ -665,7 +667,7 @@ class HudController(NSObject):
 
     @objc.python_method
     def _regenerate(self):
-        if BRAND_PREVIEW:
+        if BRAND_PREVIEW or READ_ONLY:
             return
         """Re-run just the generation half for the message on screen.
 
@@ -865,12 +867,27 @@ class HudController(NSObject):
 
         msgs = res["messages"]
         if not msgs:
+            diagnostic = (res["window"]["wid"], res.get("n_blocks"), tuple(res.get("body_heights", [])))
+            if diagnostic != self._empty_read_diagnostic:
+                self._empty_read_diagnostic = diagnostic
+                w = res["window"]
+                t = res.get("timing_ms") or {}
+                _log(f"读屏无消息 · window={w['wid']} {w['w']:.0f}x{w['h']:.0f}"
+                     f" · OCR blocks={res.get('n_blocks', 0)}"
+                     f" · capture={t.get('capture_path', '?')}"
+                     f" · text_heights={res.get('body_heights', [])}")
             self._push("applyError:", "聊天区没读到文字")
             return
 
         thems = [m for m in msgs if m.side == "them"]
         newest = thems[-1] if thems else msgs[-1]
         prev_text = thems[-2].text if len(thems) > 1 else ""
+        if READ_ONLY:
+            if newest.text != self.last_seen:
+                self.last_seen = newest.text
+                _log(f"读屏诊断成功 · 识别消息 {len(msgs)} 条 · 模型调用已暂停")
+                self._push("applyReadOnly:", (newest.text, newest.sender, prev_text))
+            return
         now = time.time()
 
         # --- anti-flood: track arrivals, never analyze mid-burst
@@ -1111,6 +1128,14 @@ class HudController(NSObject):
         self._chat_title = title
         self._render("chat", title, PALETTE["green"])
 
+    def applyReadOnly_(self, payload):
+        text, sender, prev = payload
+        self._show()
+        self._render("status", "读屏诊断模式 · 模型调用已暂停", PALETTE["amber"])
+        self._render("message", text, PALETTE["text"])
+        self._render("sender", self._context_line(sender, prev), PALETTE["muted"])
+        self.rows["cand_header"].setStringValue_("仅核对识别结果，不生成回复")
+
     def applyIncoming_(self, payload):
         # a new message landed but we are not analysing yet (burst in progress):
         # keep the previous verdict visible, just badge it
@@ -1192,7 +1217,7 @@ class HudController(NSObject):
         its judge() blocks on the model's load lock until the warm-up finishes, and the
         OCR warm-up is independent of WeChat entirely (a blank canvas, not a window).
         """
-        if BRAND_PREVIEW:
+        if BRAND_PREVIEW or READ_ONLY:
             return
         t0 = time.perf_counter()
         ocr_ms = warm_ocr()
@@ -1270,6 +1295,8 @@ def main() -> None:
         return
     warn_if_no_generation_key()
     controller = HudController.alloc().init()
+    if READ_ONLY:
+        _log("读屏诊断模式 · 不创建判断模型，不调用生成接口")
     # First line of every run: which backends are actually in play. Support requests
     # always need it, and it proves the log is live before the first message arrives.
     _base, _key, _model, _src, _api = load_credentials()

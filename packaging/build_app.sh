@@ -77,13 +77,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 
 echo "==> 写启动器"
-cat > "$APP/Contents/MacOS/jev-yaba-wechat" <<'LAUNCHER'
+cat > "$APP/Contents/Resources/bootstrap.sh" <<'LAUNCHER'
 #!/bin/zsh
 # Launcher: bootstrap the uv environment once, then exec the app.
-set -u
+set -uo pipefail
 
-RES="$(cd "$(dirname "$0")/../Resources" && pwd)"
-APP_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+RES="$(cd "$(dirname "$0")" && pwd)"
 SUPPORT="$HOME/Library/Application Support/jev-yaba-wechat"
 CONFIG="$HOME/.config/jev-yaba-wechat"
 VENV="$SUPPORT/venv"
@@ -111,7 +110,9 @@ if ! command -v uv >/dev/null 2>&1; then
     # non-blocking: a Finder launch has no terminal, and a silent multi-minute wait
     # for uv + deps is indistinguishable from "the app is broken"
     osascript -e 'display notification "首次启动：正在安装 uv（约 10 MB）" with title "jev-哑巴微信"' >/dev/null 2>&1
-    curl -LsSf https://astral.sh/uv/install.sh >>"$LOG" 2>&1
+    if ! curl -LsSf https://astral.sh/uv/install.sh | sh >>"$LOG" 2>&1; then
+        die "uv 自动安装失败，请手动安装后重试：brew install uv"
+    fi
 fi
 # re-check rather than trust the installer: PATH above already covers ~/.local/bin
 if ! command -v uv >/dev/null 2>&1; then
@@ -119,6 +120,7 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 export UV_PROJECT_ENVIRONMENT="$VENV"
+export PYTHONDONTWRITEBYTECODE=1 # keep signed app resources unchanged after imports
 export USE_TF=0                  # laya/transformers: skip the TensorFlow probe
 export HF_HUB_DISABLE_TELEMETRY=1
 
@@ -139,25 +141,30 @@ if [ "$ready" = 0 ]; then
     rm -rf "$VENV"
     log "正在创建虚拟环境并安装依赖（需要几分钟，请保持联网）"
     osascript -e 'display notification "正在准备运行环境（几分钟，需联网）" with title "jev-哑巴微信"' >/dev/null 2>&1
-    # --frozen: use the shipped uv.lock exactly, never re-resolve at runtime
-    if ! uv sync --frozen --python "@PYTHON_PIN@" --project "$RES/app" --quiet >>"$LOG" 2>&1; then
-        die "依赖安装失败，请查看日志"
-    fi
-    log "依赖安装完成"
 fi
 
+# Reconcile the frozen dependencies on every launch. A Python executable can exist
+# after an interrupted install, and an app update can change the lockfile.
+if ! uv sync --frozen --python "@PYTHON_PIN@" --project "$RES/app" --quiet >>"$LOG" 2>&1; then
+    die "依赖安装失败，请查看日志"
+fi
+log "依赖检查完成"
 log "启动 hud.py"
 exec "$VENV/bin/python" "$RES/app/src/hud.py" >>"$LOG" 2>&1
 LAUNCHER
 
 # the pin is injected here rather than written into the heredoc: the heredoc is quoted
 # (so nothing else in the launcher gets expanded at build time), this keeps it that way
-sed -i '' "s/@PYTHON_PIN@/${PY_PIN}/g" "$APP/Contents/MacOS/jev-yaba-wechat"
-if grep -q '@PYTHON_PIN@' "$APP/Contents/MacOS/jev-yaba-wechat"; then
+sed -i '' "s/@PYTHON_PIN@/${PY_PIN}/g" "$APP/Contents/Resources/bootstrap.sh"
+if grep -q '@PYTHON_PIN@' "$APP/Contents/Resources/bootstrap.sh"; then
     echo "启动器里的 Python 版本占位符没替换成功" >&2
     exit 1
 fi
-chmod +x "$APP/Contents/MacOS/jev-yaba-wechat"
+chmod +x "$APP/Contents/Resources/bootstrap.sh"
+
+echo "==> 编译原生启动器"
+xcrun clang -fobjc-arc -mmacosx-version-min=13.0 -framework Foundation \
+    "$ROOT/packaging/launcher.m" -o "$APP/Contents/MacOS/jev-yaba-wechat"
 
 echo "==> 生成图标"
 PY="$ROOT/.venv/bin/python"
@@ -178,11 +185,13 @@ check() {  # fail the build instead of shipping a broken bundle silently
 }
 check "Info.plist 合法"            "plutil -lint '$APP/Contents/Info.plist'"
 check "启动器可执行"                "[ -x '$APP/Contents/MacOS/jev-yaba-wechat' ]"
+check "原生应用启动器"              "file '$APP/Contents/MacOS/jev-yaba-wechat' | grep -q 'Mach-O'"
+check "运行引导脚本在"              "[ -x '$APP/Contents/Resources/bootstrap.sh' ]"
 check "源码进包（hud.py）"          "[ -f '$APP/Contents/Resources/app/src/hud.py' ]"
 check "锁文件进包（uv.lock）"        "[ -f '$APP/Contents/Resources/app/uv.lock' ]"
 check "Python 版本进包"             "[ -f '$APP/Contents/Resources/app/.python-version' ]"
 check "许可证进包（MIT）"           "[ -f '$APP/Contents/Resources/app/LICENSE' ]"
-check "依赖版本已冻结到 $PY_PIN"     "grep -q '${PY_PIN}' '$APP/Contents/MacOS/jev-yaba-wechat'"
+check "依赖版本已冻结到 $PY_PIN"     "grep -q '${PY_PIN}' '$APP/Contents/Resources/bootstrap.sh'"
 check "品牌形象进包"               "[ -f '$APP/Contents/Resources/app/assets/brand/mascot-v1.png' ]"
 check "品牌图标进包"               "[ -f '$APP/Contents/Resources/AppIcon.icns' ]"
 check "上游归属说明进包"           "[ -f '$APP/Contents/Resources/app/NOTICE.md' ]"

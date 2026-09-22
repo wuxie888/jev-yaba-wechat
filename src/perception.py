@@ -15,7 +15,7 @@ import re
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import Quartz
@@ -27,6 +27,7 @@ INPUT_AREA_Y_MIN = 0.24
 SIDEBAR_X_MAX = 0.30
 
 # --- content filters ---
+NEW_MESSAGE_BADGE_RE = re.compile(r"^[\^⌃↑\s]*\d+\s*条新消息$")
 TIMESTAMP_RE = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$")
 UI_NOISE = (r"折叠聊天", r"共\s*\d+", r"搜索", r"发送", r"拖入文件", r"按住说话",
             r"语音输入文字", r"按住鼠标", r"按住 说话", r"输入文字",
@@ -342,7 +343,7 @@ def _same_frame(a: bytes | None, b: bytes | None) -> bool:
 def _is_noise(b: TextBlock) -> bool:
     if b.conf < MIN_CONF or len(b.text) < MIN_TEXT_LEN:
         return True
-    if TIMESTAMP_RE.match(b.text):
+    if TIMESTAMP_RE.match(b.text) or NEW_MESSAGE_BADGE_RE.match(b.text):
         return True
     return any(re.search(pat, b.text) for pat in UI_NOISE)
 
@@ -371,9 +372,19 @@ def extract_chat_title(blocks: list[TextBlock]) -> str:
     return " ".join(b.text for b in keep).strip()
 
 
-def extract_messages(blocks: list[TextBlock], max_messages: int = 12) -> list[Message]:
+def extract_messages(blocks: list[TextBlock], max_messages: int = 12,
+                     window_height: float | None = None) -> list[Message]:
     """Turn raw OCR blocks into an ordered list of chat messages (bottom = newest)."""
-    chat = [b for b in blocks
+    # Font and line spacing stay about the same in points when the window resizes.
+    # Fixed normalized cutoffs classified even 15pt message text as a sender name
+    # in the 585pt-tall test window, silently discarding every short message.
+    scale = window_height if window_height and window_height > 0 else None
+    username_h_max = 13.5 / scale if scale else USERNAME_H_MAX
+    message_h_min = 14.0 / scale if scale else MESSAGE_H_MIN
+    line_tolerance = 7.0 / scale if scale else 0.012
+    continuation_gap = 26.0 / scale if scale else 0.045
+    sender_gap_min = 20.0 / scale if scale else 0.035
+    chat = [replace(b) for b in blocks
             if b.x >= CHAT_PANE_X_MIN and INPUT_AREA_Y_MIN < b.y < TITLE_BAR_Y_MAX
             and not _is_noise(b)]
     if not chat:
@@ -387,7 +398,7 @@ def extract_messages(blocks: list[TextBlock], max_messages: int = 12) -> list[Me
     # group blocks that sit on the same visual line
     lines: list[list[TextBlock]] = []
     for b in chat:
-        if lines and abs(b.y - lines[-1][0].y) < 0.012:
+        if lines and abs(b.y - lines[-1][0].y) < line_tolerance:
             lines[-1].append(b)
         else:
             lines.append([b])
@@ -411,7 +422,7 @@ def extract_messages(blocks: list[TextBlock], max_messages: int = 12) -> list[Me
     for b in per_line:
         side = "me" if b.x_center > midline else "them"
         gap = (b.y - messages[-1].y) if messages else 1.0
-        if messages and messages[-1].side == side and gap < 0.045:
+        if messages and messages[-1].side == side and gap < continuation_gap:
             messages[-1].lines.append(b.text)
             messages[-1].text = "\n".join(messages[-1].lines)
             messages[-1].conf = min(messages[-1].conf, b.conf)
@@ -430,14 +441,14 @@ def extract_messages(blocks: list[TextBlock], max_messages: int = 12) -> list[Me
                 # two independent signals: the name line is set in smaller type and the
                 # line under it is set in message-sized type. Both must agree — a wrong
                 # name is worse than no name.
-                and m.h < USERNAME_H_MAX and nxt.h >= MESSAGE_H_MIN
-                and (nxt.y - m.y) > 0.035):
+                and m.h < username_h_max and nxt.h >= message_h_min
+                and (nxt.y - m.y) > sender_gap_min):
             nxt.sender = m.text.strip().rstrip("：:")
             continue
         # A small-type line with nothing message-sized under it is a stray sender name
         # (WeChat renders one above every bubble, including image-only messages). It is
         # never something to judge, so drop it rather than show it as a message.
-        if m.h < USERNAME_H_MAX and len(m.text) <= 16 and "\n" not in m.text:
+        if m.h < username_h_max and len(m.text) <= 16 and "\n" not in m.text:
             continue
         named.append(m)
     return named[-max_messages:]
@@ -501,16 +512,21 @@ def read_conversation(max_messages: int = 12, previous_wid: int | None = None,
             blocks = ocr(png)
             t_ocr = time.perf_counter()
 
-    msgs = extract_messages(blocks, max_messages=max_messages)
+    body_heights = [round(b.h, 4) for b in blocks
+                    if b.x >= CHAT_PANE_X_MIN and INPUT_AREA_Y_MIN < b.y < TITLE_BAR_Y_MAX
+                    and not _is_noise(b)]
+    chat_title = extract_chat_title(blocks)
+    msgs = extract_messages(blocks, max_messages=max_messages, window_height=win.h)
     return {
         "ok": True,
         "unchanged": False,
-        "chat_title": extract_chat_title(blocks),
+        "chat_title": chat_title,
         "window": window,
         "messages": msgs,
         "timing_ms": {"capture": (t_cap - t0) * 1000, "ocr": (t_ocr - t_cap) * 1000,
                       "total": (t_ocr - t0) * 1000, "capture_path": capture_path},
         "n_blocks": len(blocks),
+        "body_heights": body_heights,
         "fingerprint": fingerprint,
     }
 

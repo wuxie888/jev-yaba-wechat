@@ -137,7 +137,7 @@ export TYPESAFE_MODEL="jev-latest"
 
 ## 当前状态与限制
 
-当前为 **0.2.0 开发预览版**，已合入截至 2026-09-22 本次同步时的读屏优化、启动预热和提前判断更新。已完成品牌界面、构建检查及 Responses 离线接口测试；本版本在真实微信中的完整读屏、GPT 调用和填入流程仍待验收。详见 [验证记录](docs/BRAND_VERIFICATION.md)。
+当前为 **0.2.1 开发预览版**，已合入截至 2026-09-22 本次同步时的读屏优化、启动预热和提前判断更新。已完成本机打包启动、录屏授权、真实微信文字读取和 GPT Responses 真实请求验证。Jev 认证与完整生成/排序/填入流程仍待验收。详见 [本机测试记录](docs/LOCAL_TESTING.md)。
 
 - OCR 受窗口布局和微信版本影响，可能误认说话人、引用内容或文章卡片；图片、语音和表情包的含义暂不支持可靠识别。
 - 风险分数和候选百分比是模型评估，不代表已验证的准确率或发送效果。
@@ -158,7 +158,9 @@ export TYPESAFE_MODEL="jev-latest"
 ./packaging/release.sh
 ```
 
-应用采用启动器包，首次正式启动安装运行依赖。当前未做 Apple 公证。只查看界面可运行 `uv run python src/hud.py --brand-preview`，该模式不读取聊天或调用模型。
+应用采用启动器包，首次正式启动安装运行依赖。当前未做 Apple 公证。构建需要 Xcode Command Line Tools（用于编译原生启动器）。只查看界面可运行 `uv run python src/hud.py --brand-preview`，该模式不读取聊天或调用模型。
+
+只排查微信读取时，可在本机配置文件加入 `export JEV_READ_ONLY=1` 后重启。面板会显示识别文字并标明“读屏诊断模式”，不调用判断或生成模型。删除该行并重启后恢复正常流程。
 
 遇到问题或有想要的话术，欢迎 [提交 Issue](https://github.com/wuxie888/jev-yaba-wechat/issues)。排查日志位于 `~/Library/Logs/jev-yaba-wechat.log`。
 

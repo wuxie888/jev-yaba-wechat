@@ -93,6 +93,7 @@ check() {
 }
 check "解压得到 jev-哑巴微信.app"      "[ -d '$TMP/jev-哑巴微信.app' ]"
 check "启动器带可执行权限"            "[ -x '$TMP/jev-哑巴微信.app/Contents/MacOS/jev-yaba-wechat' ]"
+check "运行引导脚本带可执行权限"      "[ -x '$TMP/jev-哑巴微信.app/Contents/Resources/bootstrap.sh' ]"
 check "Info.plist 合法"             "plutil -lint '$TMP/jev-哑巴微信.app/Contents/Info.plist'"
 check "图标在"                      "[ -f '$TMP/jev-哑巴微信.app/Contents/Resources/AppIcon.icns' ]"
 check "包内 Python 版本已钉住"        "[ -f '$TMP/jev-哑巴微信.app/Contents/Resources/app/.python-version' ]"
