@@ -55,6 +55,7 @@ from Foundation import NSMakeRect, NSMakeSize, NSObject, NSTimer
 sys.path.insert(0, str(Path(__file__).parent))
 import brand  # noqa: E402
 import userconfig  # noqa: E402
+import model_settings  # noqa: E402
 
 userconfig.load()   # ~/.config/jev-yaba-wechat/env -> os.environ (Finder apps inherit none)
 
@@ -66,7 +67,7 @@ import styles  # noqa: E402
 import fill  # noqa: E402
 
 BRAND_PREVIEW = "--brand-preview" in sys.argv
-READ_ONLY = userconfig.get("JEV_READ_ONLY") == "1"
+READ_ONLY = model_settings.current()["JEV_READ_ONLY"] == "1"
 
 PANEL_W, PANEL_H = 360, 614   # tall enough for 3-line candidates + the chat name row
 COLLAPSED_H = 96              # height when the panel is rolled up
@@ -218,6 +219,8 @@ class HudController(NSObject):
         self._win_wid = None          # sticky WeChat window id
         self._last_origin = None      # last applied panel origin
         self._pending_origin = None   # candidate origin awaiting confirmation
+        self.settings_window = None
+        self._settings_open = False
         self._build_panel()
         self._expanded_h = self.panel.frame().size.height
         if not BRAND_PREVIEW and not READ_ONLY:
@@ -270,11 +273,19 @@ class HudController(NSObject):
             (brand.APP_NAME, 14, 18, PALETTE["brand"]),
             (brand.TAGLINE, 39, 10, PALETTE["muted"]),
         ):
-            label = self._make_label(72, 0, PANEL_W - 86, 22, size=size, color=color, bold=size > 12)
+            label = self._make_label(72, 0, PANEL_W - 150, 22, size=size, color=color, bold=size > 12)
             label.setStringValue_(title)
             view.addSubview_(label)
-            self._fixed.append((label, 72, top, PANEL_W - 86, 22))
-        dy = 72
+            self._fixed.append((label, 72, top, PANEL_W - 150, 22))
+        settings_btn = self._make_button(0, 0, 60, 26, "设置", "openSettings:", 0)
+        settings_btn.setHidden_(False)
+        view.addSubview_(settings_btn)
+        self._fixed.append((settings_btn, PANEL_W - 72, 10, 60, 26))
+        mode_label = self._make_label(16, 0, PANEL_W - 32, 18, size=10, color=PALETTE["brand"])
+        mode_label.setStringValue_("聊天识别预览 · 模型调用已暂停" if READ_ONLY else "正常回复 · Jev 判断 + GPT 生成")
+        view.addSubview_(mode_label)
+        self._fixed.append((mode_label, 16, 66, PANEL_W - 32, 18))
+        dy = 96
         for key, size, color, bold, height in (
             ("chat", 12, PALETTE["green"], True, 18),      # 群名 / 联系人
             ("status", 10, PALETTE["muted"], False, 14),
@@ -376,8 +387,8 @@ class HudController(NSObject):
             return
         # The brand block is stable; every information row below it is content-driven.
         # Empty intent/risk fields and unfilled reply slots must not reserve blank space.
-        placements = list(self._fixed[:3])
-        dy = 78
+        placements = list(self._fixed[:5])
+        dy = 96
         limits = {"chat": (18, 36), "status": (16, 40), "message": (24, 90),
                   "sender": (16, 44), "intent": (26, 52), "confidence": (16, 32),
                   "risk": (18, 36), "actions": (18, 48), "cand_header": (18, 52)}
@@ -473,6 +484,7 @@ class HudController(NSObject):
 
         menu = AppKit.NSMenu.alloc().init()
         for title, action, key in (
+            ("模型设置…", "openSettings:", ","),
             ("显示 / 收起面板", "collapsePanel:", ""),
             ("暂停读屏", "togglePause:", ""),
             ("立即重新分析", "reanalyze:", ""),
@@ -482,8 +494,48 @@ class HudController(NSObject):
         menu.addItemWithTitle_action_keyEquivalent_(f"退出 {brand.APP_NAME}", "quitApp:", "q")
         for item in menu.itemArray():
             item.setTarget_(self)
-        self.pause_item = menu.itemArray()[1]
+        self.pause_item = menu.itemArray()[2]
         self.status_item.setMenu_(menu)
+
+    def openSettings_(self, sender):
+        from settings_window import ModelSettingsWindow
+        if self._settings_open:
+            self.settings_window.window.makeKeyAndOrderFront_(None)
+            return
+        self._settings_open = True
+        if self.settings_window is None:
+            self.settings_window = ModelSettingsWindow.alloc().initWithOwner_(self)
+        self.settings_window.show()
+
+    def settingsDidClose_(self, sender):
+        self._settings_open = False
+
+    def restartAfterSettings_(self, sender):
+        """Exit before reopening the signed bundle, without inheriting cached credentials."""
+        import model_settings
+        source = Path(__file__).resolve()
+        bundle = next((p for p in source.parents if p.suffix == ".app"), None)
+        command = ["/usr/bin/open", "-n", str(bundle)] if bundle else [sys.executable, str(source)]
+        environment = dict(os.environ)
+        for key in model_settings.KEYS:
+            environment.pop(key, None)
+        # The native launcher also needs time to exit after this Python child exits.
+        helper = ("import os,sys,time,subprocess\n"
+                  "pid=int(sys.argv[1])\n"
+                  "for _ in range(100):\n"
+                  " try: os.kill(pid,0)\n"
+                  " except ProcessLookupError: break\n"
+                  " time.sleep(0.1)\n"
+                  "time.sleep(0.5)\n"
+                  "subprocess.Popen(sys.argv[2:])\n")
+        try:
+            subprocess.Popen([sys.executable, "-c", helper, str(os.getpid()), *command],
+                             env=environment, start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            self.settings_window.mode_hint.setStringValue_("配置已保存，请手动退出并重新打开应用。")
+            return
+        AppKit.NSApplication.sharedApplication().terminate_(None)
 
     @objc.python_method
     def _make_label(self, x, y, w, h, size=13, color=None, bold=False):
@@ -835,6 +887,8 @@ class HudController(NSObject):
 
     # --------------------------------------------------------------- loop
     def tick_(self, timer):
+        if self._settings_open:
+            return
         if BRAND_PREVIEW:
             return
         if self._paused or self._busy or time.time() < self._next_read_ts:
@@ -1324,7 +1378,8 @@ def main() -> None:
         app.activateIgnoringOtherApps_(True)
         app.run()
         return
-    warn_if_no_generation_key()
+    if not READ_ONLY:
+        warn_if_no_generation_key()
     controller = HudController.alloc().init()
     if READ_ONLY:
         _log("读屏诊断模式 · 不创建判断模型，不调用生成接口")

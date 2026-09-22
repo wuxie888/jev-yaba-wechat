@@ -182,7 +182,9 @@ def credential_status() -> str:
 
 class Generator:
     def __init__(self, model: str | None = None, timeout: int = 30,
-                 api: str | None = None):
+                 api: str | None = None,
+                 credentials: tuple[str, str, str, str, str] | None = None):
+        self.credentials_override = credentials
         self.model_override = model
         self.api_override = api if api in ("openai", "anthropic", "responses") else None
         self.timeout = timeout
@@ -191,12 +193,12 @@ class Generator:
 
     def _creds_or_load(self):
         if self._creds is None:
-            base, key, model, _src, _api = load_credentials()
+            base, key, model, _src, _api = self.credentials_override or load_credentials()
             self._creds = (base, key, self.model_override or model)
         return self._creds
 
     def _call(self, prompt: str) -> str:
-        base, key, model, _src, api = load_credentials()
+        base, key, model, _src, api = self.credentials_override or load_credentials()
         # the constructor's overrides win — without this the `model` argument was accepted
         # and silently ignored, so the request went out with whatever the config named
         if self.model_override:
